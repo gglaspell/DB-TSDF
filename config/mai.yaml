@@ -44,3 +44,7 @@ db_tsdf_node:
     bins_el:        60                        # Elevation bins for the directional kernel bank
     shadow_radius:  5                         # Shadow-casting radius (in voxels)
     distance_mode:  "L2"                      # Distance metric used for the bitmask ranks: "L1" or "L2"
+
+    # --- ATAK ---------------------------------------
+    color_scheme: grayscale
+    color_bins: 32
