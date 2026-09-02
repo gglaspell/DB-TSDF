@@ -45,6 +45,7 @@ db_tsdf_node:
     shadow_radius:  5                         # Shadow-casting radius (in voxels)
     distance_mode:  "L2"                      # Distance metric used for the bitmask ranks: "L1" or "L2"
 
-    # --- ATAK ---------------------------------------
+    # --- ATAK / Geo-referencing ---------------------------------------
     color_scheme: grayscale
     color_bins: 32
+    # in_gps_topic: "/gps/fix"   # NavSatFix topic for ATAK-ROS2 integration (default: /gps/fix)

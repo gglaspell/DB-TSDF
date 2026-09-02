@@ -3,12 +3,14 @@ from launch.actions import DeclareLaunchArgument, ExecuteProcess
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
 
     bag_path = LaunchConfiguration('bag_path')
     config_name = LaunchConfiguration('config')
+    use_sim_time = LaunchConfiguration('use_sim_time')
     
     config_file_path = PathJoinSubstitution([
         FindPackageShare('db_tsdf'),
@@ -44,7 +46,7 @@ def generate_launch_description():
         name='db_tsdf_node',
         output='screen',
         parameters=[
-            {'use_sim_time': True},
+            {'use_sim_time': ParameterValue(use_sim_time, value_type=bool)},
             config_file_path
         ]
     )
@@ -59,6 +61,11 @@ def generate_launch_description():
             'config',
             default_value='college',
             description='Name prefix for .yaml and .rviz files ("college", "mai").'
+        ),
+        DeclareLaunchArgument(
+            'use_sim_time',
+            default_value='true',
+            description='Use bag /clock time. Set false for live GNSS and TF sources.'
         ),
 
         rviz_node,

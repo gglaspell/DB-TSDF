@@ -14,13 +14,11 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
-find_package(message_filters REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(pcl_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common filters)
 find_package(Boost REQUIRED COMPONENTS thread chrono)
@@ -40,19 +38,18 @@ find_package(VTK REQUIRED COMPONENTS
 
 add_executable(db_tsdf_node  src/db_tsdf_node.cpp)
 
-ament_target_dependencies(db_tsdf_node
-  rclcpp
-  tf2            tf2_ros
-  tf2_geometry_msgs
-  sensor_msgs
-  pcl_ros        pcl_conversions
-  std_srvs
-  Boost
-)
-
 target_link_libraries(db_tsdf_node
+  rclcpp::rclcpp
+  tf2::tf2
+  tf2_ros::tf2_ros
+  tf2_geometry_msgs::tf2_geometry_msgs
+  sensor_msgs::sensor_msgs
+  geometry_msgs::geometry_msgs
+  pcl_conversions::pcl_conversions
+  std_srvs::std_srvs
   ${PCL_LIBRARIES}
-  ${Boost_LIBRARIES}
+  Boost::thread
+  Boost::chrono
   OpenMP::OpenMP_CXX
   VTK::CommonCore
   VTK::CommonDataModel

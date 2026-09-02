@@ -112,8 +112,12 @@ The system is highly configurable via YAML parameters. (e.g., `config/college.ya
 | Parameter | Type | Description | Default |
 | :--- | :---: | :--- | :---: |
 | `in_cloud` | `string` | Input PointCloud2 topic | `/os_cloud_node/points` |
-| `odom_frame_id` | `string` | Fixed frame for TF lookup | `odom` |
+| `fixed_frame_id` | `string` | TF target used to integrate the TSDF; set to `map` for geo-referenced mapping | unset (uses `odom_frame_id`) |
+| `odom_frame_id` | `string` | Legacy fixed-frame fallback | `odom` |
 | `use_tf` | `bool` | Enable/Disable TF transformations | `True` |
+| `in_gps_topic` | `string` | Incoming GNSS/TAK `NavSatFix` topic | `/gps/fix` |
+| `out_gps_topic` | `string` | Retained valid-fix output for a TAK bridge | `/current_gps_fix` |
+| `geo_origin_*` | parameters | Explicit WGS-84/ENU map datum used in export metadata | disabled |
 | `verbose_init` | `bool` | Full parameter dump + kernel preview at startup | `False` |
 
 ### Grid Definition
@@ -136,21 +140,40 @@ The system is highly configurable via YAML parameters. (e.g., `config/college.ya
 
 ## 5. Output Data and Services
 
-The node provides four `std_srvs/srv/Trigger` services to export the reconstructed map. Each one runs in the background and writes its output relative to the directory the node was launched from:
+The node provides `std_srvs/srv/Trigger` services to export the reconstructed map and query its configured geo-origin. Each export runs in the background and writes its output relative to the directory the node was launched from. A retained valid-fix GPS topic is also published for an external TAK bridge.
 
-| Service | Output | Description |
+| Service / Topic | Output | Description |
 | :--- | :--- | :--- |
 | `/save_grid_pcd` | `grid_data.pcd` | Occupied-voxel point cloud (PCD) |
 | `/save_grid_ply` | `grid_data.ply` | Occupied-voxel point cloud (PLY) |
 | `/save_grid_csv` | `grid_data_csv/` | Per-cell voxel data (CSV + PLY), one file pair per allocated subgrid cell |
 | `/save_grid_mesh` | `mesh.stl` | Surface mesh extracted with Marching Cubes |
+| `/save_grid_atak_zip` | `atak_mesh.zip` | Geo-referenced OBJ + MTL package and `atak_mesh.origin.json`; requires an explicit datum |
+| `/get_geo_origin` | JSON in response.message | Immutable WGS-84/ENU datum, frame IDs, and latest valid fix |
+| `out_gps_topic` | `sensor_msgs/NavSatFix` (latched) | Latest valid fix for a downstream ATAK/TAK bridge |
 
 ```bash
 ros2 service call /save_grid_pcd  std_srvs/srv/Trigger "{}"
 ros2 service call /save_grid_ply  std_srvs/srv/Trigger "{}"
 ros2 service call /save_grid_csv  std_srvs/srv/Trigger "{}"
 ros2 service call /save_grid_mesh std_srvs/srv/Trigger "{}"
+ros2 service call /save_grid_atak_zip std_srvs/srv/Trigger "{}"
+ros2 service call /get_geo_origin std_srvs/srv/Trigger "{}"
 ```
+
+## 6. Geo-referenced ATAK/TAK workflow
+
+For live mapping, use `robot_localization` to derive `map -> odom` from the
+GNSS fix, IMU, and local odometry. Configure DB-TSDF with
+`fixed_frame_id: map` and the same explicit WGS-84 datum used by the GNSS
+pipeline. The `georeference_launch.py` launch file provides the
+`navsat_transform_node` plus global-EKF half of that pipeline; it expects a
+local estimator to already provide `odom -> base_link` and local odometry.
+
+The detailed frame contract, launch command, datum conventions, and ATAK bridge
+boundary are in [docs/GEOREFERENCE_AND_ATAK.md](docs/GEOREFERENCE_AND_ATAK.md).
+Use `use_sim_time:=false` with live GNSS/TF; the dataset launch default remains
+`true` for bag playback.
 
  
 

@@ -1,0 +1,26 @@
+# DB-TSDF georeferenced deployment template.
+#
+# Replace the datum with the same surveyed WGS-84 ellipsoid-height datum passed
+# to georeference_launch.py. Keeping geo_origin_configured false is deliberate:
+# DB-TSDF will refuse a georeferenced export until a real datum is supplied.
+db_tsdf_node:
+  ros__parameters:
+    in_cloud: '/os_cloud_node/points'
+    fixed_frame_id: 'map'
+    earth_frame_id: 'earth'
+    odom_frame_id: 'odom'       # legacy fallback only; fixed_frame_id takes precedence
+    use_tf: true
+    use_tf_topic: false          # use TF2: map -> odom -> base_link -> sensor
+
+    in_gps_topic: '/gps/fix'     # incoming ATAK/TAK bridge or GNSS receiver fix
+    out_gps_topic: '/current_gps_fix'  # retained valid-fix handoff to the bridge
+
+    geo_origin_configured: false
+    geo_origin_latitude: 0.0
+    geo_origin_longitude: 0.0
+    geo_origin_altitude: 0.0     # WGS-84 ellipsoid height, not MSL altitude
+    geo_origin_yaw: 0.0          # must equal georeference_launch.py datum yaw (rad)
+    geo_origin_altitude_reference: 'ellipsoid'
+
+    color_scheme: 'grayscale'
+    color_bins: 32

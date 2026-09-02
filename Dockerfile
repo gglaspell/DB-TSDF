@@ -18,6 +18,7 @@ RUN apt update && apt install -y --no-install-recommends \
     build-essential \
     python3-pip \
     wget \
+    zip \
     && rm -rf /var/lib/apt/lists/*
 
 # --- DB-TSDF build/runtime dependencies not included in humble-desktop -----
@@ -29,6 +30,7 @@ RUN apt update && apt install -y --no-install-recommends \
     ros-humble-pcl-conversions \
     ros-humble-pcl-ros \
     ros-humble-message-filters \
+    ros-humble-robot-localization \
     libeigen3-dev \
     libboost-all-dev \
     libomp-dev \
