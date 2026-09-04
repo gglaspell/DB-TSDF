@@ -10,6 +10,7 @@ def generate_launch_description():
 
     bag_path = LaunchConfiguration('bag_path')
     config_name = LaunchConfiguration('config')
+    mask_bits = LaunchConfiguration('mask_bits')
     use_sim_time = LaunchConfiguration('use_sim_time')
     
     config_file_path = PathJoinSubstitution([
@@ -42,7 +43,10 @@ def generate_launch_description():
 
     db_tsdf_node = Node(
         package='db_tsdf',
-        executable='db_tsdf_node',
+        executable=PythonExpression([
+            "'db_tsdf_node_32' if '", mask_bits,
+            "' == '32' else 'db_tsdf_node'"
+        ]),
         name='db_tsdf_node',
         output='screen',
         parameters=[
@@ -61,6 +65,12 @@ def generate_launch_description():
             'config',
             default_value='college',
             description='Name prefix for .yaml and .rviz files ("college", "mai").'
+        ),
+        DeclareLaunchArgument(
+            'mask_bits',
+            default_value='16',
+            choices=['16', '32'],
+            description='Distance-mask width. The 32-bit backend uses twice the voxel storage.'
         ),
         DeclareLaunchArgument(
             'use_sim_time',

@@ -40,8 +40,19 @@
 #include <pcl/common/transforms.h>
 
 // DB-TSDF
-#include <db_tsdf/tsdf3d_16.hpp>
-#include <db_tsdf/grid_16.hpp>
+#include <db_tsdf/tsdf3d.hpp>
+
+#ifndef DB_TSDF_MASK_BITS
+#define DB_TSDF_MASK_BITS 16
+#endif
+
+#if DB_TSDF_MASK_BITS == 16
+using TSDFBackend = TSDF3D16;
+#elif DB_TSDF_MASK_BITS == 32
+using TSDFBackend = TSDF3D32;
+#else
+#error "DB_TSDF_MASK_BITS must be 16 or 32"
+#endif
 
 class TSDFNode : public rclcpp::Node
 {
@@ -128,6 +139,7 @@ public:
 
         RCLCPP_INFO(this->get_logger(), "------------------------------------------------------");
         RCLCPP_INFO(this->get_logger(), "Initializing DB-TSDF Node with Parameters:");
+        RCLCPP_INFO(this->get_logger(), "  Distance Mask:   %d-bit", DB_TSDF_MASK_BITS);
         RCLCPP_INFO(this->get_logger(), " ");
 
         RCLCPP_INFO(this->get_logger(), "  Grid Params:");
@@ -390,7 +402,7 @@ private:
     int m_colorBins;
 
     // TDF grid and geometry
-    TSDF3D16 m_grid3d;
+    TSDFBackend m_grid3d;
     double m_tdfGridSizeX_low, m_tdfGridSizeX_high,
            m_tdfGridSizeY_low, m_tdfGridSizeY_high,
            m_tdfGridSizeZ_low, m_tdfGridSizeZ_high,

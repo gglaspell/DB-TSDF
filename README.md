@@ -88,6 +88,14 @@ The launch system uses a single main launch file (`mapper_launch.py`) and a conf
    ros2 launch db_tsdf mapper_launch.py config:=mai
    ```
 
+   The launch file uses the faster 16-bit distance-mask backend by default. To
+   run the 32-bit backend with the same configuration:
+   ```bash
+   ros2 launch db_tsdf mapper_launch.py config:=mai mask_bits:=32
+   ```
+   The 32-bit voxel layout occupies 8 bytes instead of 4, so size
+   `tdf_max_cells` for the available memory.
+
 3. In a second terminal, play the dataset back:
 
    For the Docker container, open one with:
@@ -107,6 +115,8 @@ The launch system uses a single main launch file (`mapper_launch.py`) and a conf
 ## 4. Configuration
 
 The system is highly configurable via YAML parameters. (e.g., `config/college.yaml`).
+The `mask_bits` launch argument selects either the 16-bit (default) or 32-bit
+executable; it is not a ROS parameter and cannot be changed after startup.
 
 ### Core Parameters
 | Parameter | Type | Description | Default |

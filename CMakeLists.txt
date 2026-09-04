@@ -36,35 +36,52 @@ find_package(VTK REQUIRED COMPONENTS
   ImagingMorphological
 )
 
-add_executable(db_tsdf_node  src/db_tsdf_node.cpp)
+function(add_db_tsdf_node target_name mask_bits)
+  add_executable(${target_name} src/db_tsdf_node.cpp)
+  target_compile_definitions(${target_name} PRIVATE DB_TSDF_MASK_BITS=${mask_bits})
 
-target_link_libraries(db_tsdf_node
-  rclcpp::rclcpp
-  tf2::tf2
-  tf2_ros::tf2_ros
-  tf2_geometry_msgs::tf2_geometry_msgs
-  sensor_msgs::sensor_msgs
-  geometry_msgs::geometry_msgs
-  pcl_conversions::pcl_conversions
-  std_srvs::std_srvs
-  ${PCL_LIBRARIES}
-  Boost::thread
-  Boost::chrono
-  OpenMP::OpenMP_CXX
-  VTK::CommonCore
-  VTK::CommonDataModel
-  VTK::FiltersCore
-  VTK::IOXML
-  VTK::ImagingCore
-  VTK::ImagingGeneral
-)
+  target_link_libraries(${target_name}
+    rclcpp::rclcpp
+    tf2::tf2
+    tf2_ros::tf2_ros
+    tf2_geometry_msgs::tf2_geometry_msgs
+    sensor_msgs::sensor_msgs
+    geometry_msgs::geometry_msgs
+    pcl_conversions::pcl_conversions
+    std_srvs::std_srvs
+    ${PCL_LIBRARIES}
+    Boost::thread
+    Boost::chrono
+    OpenMP::OpenMP_CXX
+    VTK::CommonCore
+    VTK::CommonDataModel
+    VTK::FiltersCore
+    VTK::IOXML
+    VTK::ImagingCore
+    VTK::ImagingGeneral
+  )
 
-target_include_directories(db_tsdf_node PRIVATE
-  include
-  ${Boost_INCLUDE_DIRS}
-  ${PCL_INCLUDE_DIRS}
-  ${VTK_INCLUDE_DIRS}
-)
+  target_include_directories(${target_name} PRIVATE
+    include
+    ${Boost_INCLUDE_DIRS}
+    ${PCL_INCLUDE_DIRS}
+    ${VTK_INCLUDE_DIRS}
+  )
+endfunction()
+
+# Keep the historical executable name as the default 16-bit implementation.
+add_db_tsdf_node(db_tsdf_node 16)
+add_db_tsdf_node(db_tsdf_node_32 32)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_test REQUIRED)
+  add_executable(db_tsdf_mask_test test/test_mask.cpp)
+  target_include_directories(db_tsdf_mask_test PRIVATE include)
+  ament_add_test(db_tsdf_mask_test
+    COMMAND $<TARGET_FILE:db_tsdf_mask_test>
+    GENERATE_RESULT_FOR_RETURN_CODE_ZERO
+  )
+endif()
 
 install(DIRECTORY 
   launch/
@@ -78,6 +95,7 @@ install(DIRECTORY
 
 install(TARGETS
   db_tsdf_node
+  db_tsdf_node_32
   DESTINATION lib/${PROJECT_NAME}
 )
 

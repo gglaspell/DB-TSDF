@@ -206,8 +206,9 @@
                         </svg>
                     </div>
                     <h4>Bitmask Distance Encoding</h4>
-                    <p>Truncated distances are stored as compact bitmasks updated with a single bitwise AND — a 16-bit
-                        layout keeps the per-voxel footprint at just a few bytes.</p>
+                    <p>Truncated distances are stored as compact bitmasks updated with a single bitwise AND. The
+                        default 16-bit layout uses 4 bytes per voxel; a selectable 32-bit backend preserves more
+                        distance ranks with an 8-byte voxel layout.</p>
                 </div>
 
                 <div class="feature-card">
@@ -280,11 +281,12 @@
                 <div style="text-align:left; max-width:380px;">
                     <span style="display:inline-block; padding:3px 12px; border-radius:999px; font-size:0.7rem;
                         font-weight:700; letter-spacing:0.06em; text-transform:uppercase; background:var(--accent);
-                        color:#fff; margin-bottom:6px;">New · 16-bit version</span>
+                        color:#fff; margin-bottom:6px;">Selectable · 16/32-bit</span>
                     <p style="margin:0; color:var(--text-secondary); font-size:0.9rem;">
                         The figures and tables above reflect the <strong>32-bit</strong> variant evaluated in the
-                        paper (~150&nbsp;ms/frame). The <strong>16-bit version released in this repository</strong>
-                        is a newer, leaner iteration that runs in just <strong>20–40&nbsp;ms per scan</strong>.
+                        paper (~150&nbsp;ms/frame). This repository defaults to the newer <strong>16-bit
+                        backend</strong> (20–40&nbsp;ms per scan) and also provides a <strong>32-bit backend</strong>
+                        for comparisons using the paper's distance-mask width.
                     </p>
                 </div>
             </div>
