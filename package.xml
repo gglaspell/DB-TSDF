@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>db_tsdf</name>
-  <version>1.0.0</version>
+  <version>1.1.0</version>
   <description>DB-TSDF: Directional Bitmask-based Truncated Signed Distance Fields for Efficient Volumetric Mapping </description>
   <maintainer email="jemaealv@upo.es">Jose E. Maese</maintainer>
   <license>MIT</license>
@@ -18,7 +18,20 @@
   <depend>geometry_msgs</depend>
   <depend>pcl_conversions</depend>
   <depend>std_srvs</depend>
-  <depend>PCL</depend>
+  <depend>libpcl-all-dev</depend>
+  <depend>eigen</depend>
+  <depend>libvtk9-dev</depend>
+  <depend>nlohmann-json-dev</depend>
+  <depend>libssl-dev</depend>
+  <depend>libomp-dev</depend>
+  <depend>std_msgs</depend>
+  <depend>rcl_interfaces</depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>zip</exec_depend>
+  <exec_depend>rosbag2_transport</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>rviz2</exec_depend>
   <depend>boost</depend>
 
 
@@ -32,6 +45,8 @@
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
   <test_depend>ament_cmake_test</test_depend>
+  <test_depend>rosbag2_py</test_depend>
+  <test_depend>tf2_msgs</test_depend>
 
   <!-- Export build type -->
   <export>

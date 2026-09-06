@@ -1,0 +1,173 @@
+{
+  "schema": "db-tsdf-benchmark/v1",
+  "repeatable": true,
+  "input": "noise-free-plane-v1",
+  "groups": [
+    {
+      "mask_bits": 16,
+      "threads": 1,
+      "repeats": 5,
+      "state_hash": 13073339954279333677,
+      "integration_p50_ms_mean": 0.1455501,
+      "integration_p50_ms_stdev": 0.0028930001166609103,
+      "integration_p95_ms_mean": 0.18660051000000005,
+      "integration_p99_ms_mean": 0.23449434199999994,
+      "peak_rss_bytes_max": 58130432
+    },
+    {
+      "mask_bits": 16,
+      "threads": 2,
+      "repeats": 5,
+      "state_hash": 13073339954279333677,
+      "integration_p50_ms_mean": 0.0802959,
+      "integration_p50_ms_stdev": 0.002057531330259638,
+      "integration_p95_ms_mean": 0.1386464100000001,
+      "integration_p99_ms_mean": 0.24288208199999983,
+      "peak_rss_bytes_max": 56029184
+    },
+    {
+      "mask_bits": 16,
+      "threads": 4,
+      "repeats": 5,
+      "state_hash": 13073339954279333677,
+      "integration_p50_ms_mean": 0.0614026,
+      "integration_p50_ms_stdev": 0.0014483086428658776,
+      "integration_p95_ms_mean": 0.11007594000000014,
+      "integration_p99_ms_mean": 0.24731582799999977,
+      "peak_rss_bytes_max": 50094080
+    },
+    {
+      "mask_bits": 16,
+      "threads": 16,
+      "repeats": 5,
+      "state_hash": 13073339954279333677,
+      "integration_p50_ms_mean": 0.0483873,
+      "integration_p50_ms_stdev": 0.005525272398262371,
+      "integration_p95_ms_mean": 0.14994355000000031,
+      "integration_p99_ms_mean": 0.4957002299999994,
+      "peak_rss_bytes_max": 56193024
+    },
+    {
+      "mask_bits": 32,
+      "threads": 1,
+      "repeats": 5,
+      "state_hash": 5938767009695785021,
+      "integration_p50_ms_mean": 0.1514043,
+      "integration_p50_ms_stdev": 0.0009461775467638177,
+      "integration_p95_ms_mean": 0.18848996000000004,
+      "integration_p99_ms_mean": 0.23736039199999992,
+      "peak_rss_bytes_max": 49881088
+    },
+    {
+      "mask_bits": 32,
+      "threads": 2,
+      "repeats": 5,
+      "state_hash": 5938767009695785021,
+      "integration_p50_ms_mean": 0.079626,
+      "integration_p50_ms_stdev": 0.0027686601678429267,
+      "integration_p95_ms_mean": 0.12552202000000012,
+      "integration_p99_ms_mean": 0.2527493639999998,
+      "peak_rss_bytes_max": 53964800
+    },
+    {
+      "mask_bits": 32,
+      "threads": 4,
+      "repeats": 5,
+      "state_hash": 5938767009695785021,
+      "integration_p50_ms_mean": 0.0627609,
+      "integration_p50_ms_stdev": 0.0028526870534638068,
+      "integration_p95_ms_mean": 0.14180971000000017,
+      "integration_p99_ms_mean": 0.31034290199999975,
+      "peak_rss_bytes_max": 50135040
+    },
+    {
+      "mask_bits": 32,
+      "threads": 16,
+      "repeats": 5,
+      "state_hash": 5938767009695785021,
+      "integration_p50_ms_mean": 0.0646585,
+      "integration_p50_ms_stdev": 0.012817786953097638,
+      "integration_p95_ms_mean": 0.20831147000000053,
+      "integration_p99_ms_mean": 0.7609541339999991,
+      "peak_rss_bytes_max": 49938432
+    }
+  ],
+  "build": {
+    "build_type": "RelWithDebInfo",
+    "compiler": "15.2.0",
+    "cpu": "13th Gen Intel(R) Core(TM) i9-13900K",
+    "cxx_flags": " -O2 -g -DNDEBUG -std=c++20 -fopenmp -Wall -Wextra -Wpedantic -DEIGEN_MAX_ALIGN_BYTES=16 -DEIGEN_MALLOC_ALREADY_ALIGNED=1",
+    "eigen": "3.4.0",
+    "git_dirty_at_configure": 1,
+    "git_revision": "a5eeedb9c72d16a16dbb1cd769d282e853754192",
+    "logical_cpus": 32,
+    "native": 0,
+    "pcl": "1.15.1",
+    "sanitizers": 0,
+    "source_sha256": "2046e9ab3f824c8b4b1c12c8067444d809d262b1179d81d1bbe555bc291b2026",
+    "system": {
+      "architecture": "x86_64",
+      "os": "Linux",
+      "release": "6.6.87.2-microsoft-standard-WSL2+"
+    },
+    "vtk": "9.5.2"
+  },
+  "parameters": {
+    "bins_az": 16,
+    "bins_el": 8,
+    "capacity_policy": "stop",
+    "distance_mode": "L2",
+    "kernel_size": 5,
+    "max_range": 1000.0,
+    "memory_budget_mb": 0.0,
+    "mesh_mode": "distance",
+    "mesh_smoothing_sigma": -1.0,
+    "min_range": 0.0,
+    "occ_min_hits": 3,
+    "pc_downsampling": 1,
+    "shadow_radius": 3,
+    "tdfGridSizeX_high": 3.0,
+    "tdfGridSizeX_low": 0.0,
+    "tdfGridSizeY_high": 3.0,
+    "tdfGridSizeY_low": 0.0,
+    "tdfGridSizeZ_high": 3.0,
+    "tdfGridSizeZ_low": 0.0,
+    "tdf_grid_res": 0.1,
+    "tdf_max_cells": 27
+  },
+  "quality": {
+    "accuracy_m": {
+      "fraction_within_tolerance": 1.0,
+      "max": 0.10000002384185791,
+      "mean": 0.06627635730078707,
+      "p50": 0.09999996423721313,
+      "p95": 0.10000002384185791,
+      "p99": 0.10000002384185791,
+      "rmse": 0.0814102805379014
+    },
+    "completeness_m": {
+      "fraction_within_tolerance": 1.0,
+      "max": 3.3717478231665154e-07,
+      "mean": 4.4880998504057445e-08,
+      "p50": 0.0,
+      "p95": 2.384185791015625e-07,
+      "p99": 2.4575624024691933e-07,
+      "rmse": 8.646098368132715e-08
+    },
+    "f_score": 1.0,
+    "method": "nearest neighbors on occupied voxel centers and reference points",
+    "precision": 1.0,
+    "recall": 1.0,
+    "reference_points": 576,
+    "surface_points": 1708,
+    "tolerance_m": 0.15
+  },
+  "fixture_frames": 20,
+  "points_per_frame": 576,
+  "manifest_sha256": "fe27ae5dd80e7f3165dbaceb5fffb42ea36c0d9c21051ea0a91d7124b7c08869",
+  "inputs_sha256": {
+    "plane.pcd": "dc0aa3228838472fd38eaea1f425e9e6f3b838a370e1360e0e6e8b59d20bafc1"
+  },
+  "measured_on": "2026-09-05",
+  "notes": "Synthetic regression baseline; no before/after speedup or real-dataset accuracy claim. Peak RSS is whole process."
+}

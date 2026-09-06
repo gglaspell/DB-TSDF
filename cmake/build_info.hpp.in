@@ -1,0 +1,5 @@
+#pragma once
+#define DB_TSDF_CXX_FLAGS R"dbtsdf(@db_tsdf_flags@)dbtsdf"
+#cmakedefine01 DB_TSDF_BUILD_NATIVE
+#cmakedefine01 DB_TSDF_BUILD_SANITIZERS
+#cmakedefine01 DB_TSDF_GIT_DIRTY

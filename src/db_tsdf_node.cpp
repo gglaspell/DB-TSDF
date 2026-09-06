@@ -6,6 +6,15 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <filesystem>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <nlohmann/json.hpp>
+#include <db_tsdf/export_worker.hpp>
+#include <db_tsdf/provenance.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <rcl_interfaces/msg/parameter_descriptor.hpp>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -31,8 +40,8 @@
 #include <geometry_msgs/msg/transform_stamped.hpp>
 
 // TF2
-#include "tf2_ros/transform_listener.h"
-#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.hpp"
+#include "tf2_ros/buffer.hpp"
 
 // PCL
 #include <pcl/point_types.h>
@@ -54,9 +63,23 @@ using TSDFBackend = TSDF3D32;
 #error "DB_TSDF_MASK_BITS must be 16 or 32"
 #endif
 
+using Json = nlohmann::json;
+namespace fs = std::filesystem;
+extern char **environ;
+
 class TSDFNode : public rclcpp::Node
 {
 private:
+    template<class T> T startupParameter(const std::string& name,const T& value) {
+        rcl_interfaces::msg::ParameterDescriptor descriptor;
+        descriptor.read_only=true;
+        if constexpr (std::is_same_v<T,int>) {
+            const auto result=this->declare_parameter<int64_t>(name,value,descriptor);
+            if (result<std::numeric_limits<int>::min() || result>std::numeric_limits<int>::max())
+                throw std::invalid_argument(name+" exceeds integer range");
+            return static_cast<int>(result);
+        } else return this->declare_parameter<T>(name,value,descriptor);
+    }
     struct GeoOrigin
     {
         bool configured{false};
@@ -72,15 +95,15 @@ public:
         : Node(node_name)
     {
         // Parameters
-        m_inCloudTopic      = this->declare_parameter<std::string>("in_cloud", "/os_cloud_node/points");
-        m_odomFrameId       = this->declare_parameter<std::string>("odom_frame_id", "odom");
-        m_fixedFrameId      = this->declare_parameter<std::string>("fixed_frame_id", "");
-        m_earthFrameId      = this->declare_parameter<std::string>("earth_frame_id", "earth");
-        m_useTf             = this->declare_parameter<bool>("use_tf", true);
-        m_useTfTopic        = this->declare_parameter<bool>("use_tf_topic", true);
-        m_inTfTopic         = this->declare_parameter<std::string>("in_tf_topic", "/gt_icp/transform");
-        m_inGpsTopic        = this->declare_parameter<std::string>("in_gps_topic", "/gps/fix");
-        m_outGpsTopic       = this->declare_parameter<std::string>("out_gps_topic", "/current_gps_fix");
+        m_inCloudTopic      = startupParameter<std::string>("in_cloud", "/os_cloud_node/points");
+        m_odomFrameId       = startupParameter<std::string>("odom_frame_id", "odom");
+        m_fixedFrameId      = startupParameter<std::string>("fixed_frame_id", "");
+        m_earthFrameId      = startupParameter<std::string>("earth_frame_id", "earth");
+        m_useTf             = startupParameter<bool>("use_tf", true);
+        m_useTfTopic        = startupParameter<bool>("use_tf_topic", false);
+        m_inTfTopic         = startupParameter<std::string>("in_tf_topic", "/gt_icp/transform");
+        m_inGpsTopic        = startupParameter<std::string>("in_gps_topic", "/gps/fix");
+        m_outGpsTopic       = startupParameter<std::string>("out_gps_topic", "/current_gps_fix");
 
         // A map frame is required for a geographically anchored TSDF. Leave
         // fixed_frame_id empty only for legacy local-only deployments, where
@@ -93,49 +116,82 @@ public:
                         m_fixedFrameId.c_str());
         }
 
-        m_geoOrigin.configured = this->declare_parameter<bool>("geo_origin_configured", false);
-        m_geoOrigin.latitude_deg = this->declare_parameter<double>("geo_origin_latitude", 0.0);
-        m_geoOrigin.longitude_deg = this->declare_parameter<double>("geo_origin_longitude", 0.0);
-        m_geoOrigin.ellipsoid_height_m = this->declare_parameter<double>("geo_origin_altitude", 0.0);
-        m_geoOrigin.map_yaw_rad = this->declare_parameter<double>("geo_origin_yaw", 0.0);
-        m_geoOrigin.altitude_reference = this->declare_parameter<std::string>(
+        m_geoOrigin.configured = startupParameter<bool>("geo_origin_configured", false);
+        m_geoOrigin.latitude_deg = startupParameter<double>("geo_origin_latitude", 0.0);
+        m_geoOrigin.longitude_deg = startupParameter<double>("geo_origin_longitude", 0.0);
+        m_geoOrigin.ellipsoid_height_m = startupParameter<double>("geo_origin_altitude", 0.0);
+        m_geoOrigin.map_yaw_rad = startupParameter<double>("geo_origin_yaw", 0.0);
+        m_geoOrigin.altitude_reference = startupParameter<std::string>(
             "geo_origin_altitude_reference", "ellipsoid");
         if (m_geoOrigin.configured) {
             validateGeoOrigin(m_geoOrigin);
         }
 
-        m_tdfGridSizeX_low  = this->declare_parameter<double>("tdfGridSizeX_low", -10.0);
-        m_tdfGridSizeX_high = this->declare_parameter<double>("tdfGridSizeX_high", 10.0);
-        m_tdfGridSizeY_low  = this->declare_parameter<double>("tdfGridSizeY_low", -10.0);
-        m_tdfGridSizeY_high = this->declare_parameter<double>("tdfGridSizeY_high", 10.0);
-        m_tdfGridSizeZ_low  = this->declare_parameter<double>("tdfGridSizeZ_low", -10.0);
-        m_tdfGridSizeZ_high = this->declare_parameter<double>("tdfGridSizeZ_high", 10.0);
-        m_tdfGridRes        = this->declare_parameter<double>("tdf_grid_res", 0.10);
-        m_tdfMaxCells       = this->declare_parameter<double>("tdf_max_cells", 10000.0);
-        m_minRange          = this->declare_parameter<double>("min_range", 1.0);
-        m_maxRange          = this->declare_parameter<double>("max_range", 100.0);
-        m_PcDownsampling    = this->declare_parameter<int>("pc_downsampling", 1);
-        m_occMinHits        = this->declare_parameter<int>("occ_min_hits", 1);
-        m_binsAz            = this->declare_parameter<int>("bins_az", 40);
-        m_binsEl            = this->declare_parameter<int>("bins_el", 40);
-        m_shadowRadius      = this->declare_parameter<int>("shadow_radius", 6);
-        m_distanceMode      = this->declare_parameter<std::string>("distance_mode", "L1");
-        m_kernelSize        = this->declare_parameter<int>("kernel_size", 11);
-        m_verboseInit       = this->declare_parameter<bool>("verbose_init", false);
+        m_tdfGridSizeX_low  = startupParameter<double>("tdfGridSizeX_low", -10.0);
+        m_tdfGridSizeX_high = startupParameter<double>("tdfGridSizeX_high", 10.0);
+        m_tdfGridSizeY_low  = startupParameter<double>("tdfGridSizeY_low", -10.0);
+        m_tdfGridSizeY_high = startupParameter<double>("tdfGridSizeY_high", 10.0);
+        m_tdfGridSizeZ_low  = startupParameter<double>("tdfGridSizeZ_low", -10.0);
+        m_tdfGridSizeZ_high = startupParameter<double>("tdfGridSizeZ_high", 10.0);
+        m_tdfGridRes        = startupParameter<double>("tdf_grid_res", 0.10);
+        rcl_interfaces::msg::ParameterDescriptor capacity_descriptor;
+        capacity_descriptor.read_only=true;
+        capacity_descriptor.dynamic_typing=true;  // Accept legacy integer-valued YAML doubles.
+        auto capacity=this->declare_parameter("tdf_max_cells",rclcpp::ParameterValue(10000),capacity_descriptor);
+        m_tdfMaxCells=capacity.get_type()==rclcpp::ParameterType::PARAMETER_INTEGER ?
+            static_cast<double>(capacity.get<int64_t>()) : capacity.get<double>();
+        m_minRange          = startupParameter<double>("min_range", 1.0);
+        m_maxRange          = startupParameter<double>("max_range", 100.0);
+        m_PcDownsampling    = startupParameter<int>("pc_downsampling", 1);
+        m_occMinHits        = startupParameter<int>("occ_min_hits", 1);
+        m_binsAz            = startupParameter<int>("bins_az", 40);
+        m_binsEl            = startupParameter<int>("bins_el", 40);
+        m_shadowRadius      = startupParameter<int>("shadow_radius", 6);
+        m_distanceMode      = startupParameter<std::string>("distance_mode", "L1");
+        m_kernelSize        = startupParameter<int>("kernel_size", 11);
+        m_verboseInit       = startupParameter<bool>("verbose_init", false);
 
-        m_colorScheme       = this->declare_parameter<std::string>("color_scheme", "grayscale");
-        m_colorBins         = this->declare_parameter<int>("color_bins", 32);
+        m_colorScheme       = startupParameter<std::string>("color_scheme", "grayscale");
+        m_colorBins         = startupParameter<int>("color_bins", 32);
 
-        if (m_kernelSize % 2 == 0) {
-            RCLCPP_WARN(this->get_logger(), "Kernel size must be odd! Forcing %d -> %d.", m_kernelSize, m_kernelSize + 1);
-            m_kernelSize++;
-        }
-
-        if (m_colorBins < 1) {
-            RCLCPP_WARN(this->get_logger(), "color_bins must be >= 1. Forcing %d -> 1.", m_colorBins);
-            m_colorBins = 1;
-            this->set_parameter(rclcpp::Parameter("color_bins", m_colorBins));
-        }
+        m_numThreads = startupParameter<int>("num_threads", 0);
+        m_capacityPolicy = startupParameter<std::string>("capacity_policy", "stop");
+        m_memoryBudget = startupParameter<double>("memory_budget_mb", 0.0);
+        m_snapshotBudget = startupParameter<double>("snapshot_budget_mb", 0.0);
+        m_sensorFrame = startupParameter<std::string>("sensor_frame", "");
+        m_publishCloud = startupParameter<bool>("publish_cloud", true);
+        m_legacyAllowNearest = startupParameter<bool>("legacy_allow_nearest", true);
+        m_allowLatestTf = startupParameter<bool>("allow_latest_tf", false);
+        m_tfTimeout = startupParameter<double>("tf_timeout", 0.1);
+        const auto legacySkew=startupParameter<double>("legacy_max_skew",0.1);
+        if (!std::isfinite(legacySkew) || legacySkew<0 || legacySkew>10)
+            throw std::invalid_argument("legacy_max_skew must be finite and between 0 and 10 seconds");
+        m_maxSkew = rclcpp::Duration::from_seconds(legacySkew);
+        m_outputDirectory = fs::absolute(startupParameter<std::string>("output_directory", "maps"));
+        m_initialCheckpoint = startupParameter<std::string>("initial_checkpoint", "");
+        const auto meshMode = startupParameter<std::string>("mesh_mode", "occupancy");
+        const double meshSigma = startupParameter<double>("mesh_smoothing_sigma", -1.0);
+        const auto reliability = startupParameter<std::string>("cloud_reliability", "best_effort");
+        const int queueDepth = startupParameter<int>("cloud_queue_depth", 10);
+        if (m_PcDownsampling < 1 || !std::isfinite(m_minRange) || !std::isfinite(m_maxRange) ||
+            m_minRange < 0 || m_maxRange <= m_minRange)
+            throw std::invalid_argument("pc_downsampling must be positive and ranges finite, nonnegative, ordered");
+        if (!std::isfinite(m_tdfMaxCells) || m_tdfMaxCells < 1 ||
+            m_tdfMaxCells > std::numeric_limits<int>::max() || std::floor(m_tdfMaxCells)!=m_tdfMaxCells)
+            throw std::invalid_argument("tdf_max_cells must be a positive integer");
+        if (m_colorBins < 1 || m_colorBins > 4096 || normalizeColorScheme(m_colorScheme)!=m_colorScheme)
+            throw std::invalid_argument("invalid color_scheme or color_bins (must be 1..4096)");
+        if (queueDepth<1 || queueDepth>100000 || (reliability!="reliable" && reliability!="best_effort"))
+            throw std::invalid_argument("cloud_queue_depth must be 1..100000; cloud_reliability reliable or best_effort");
+        if (!std::isfinite(m_snapshotBudget) || m_snapshotBudget<0 ||
+            !std::isfinite(m_tfTimeout) || m_tfTimeout<0 || m_tfTimeout>10 || m_maxSkew.nanoseconds()<0)
+            throw std::invalid_argument("invalid snapshot budget or TF timing limits");
+        if (m_sensorFrame.size() && (!m_useTf || m_useTfTopic))
+            throw std::invalid_argument("sensor_frame requires generic TF mode");
+        fs::create_directories(m_outputDirectory);
+        const auto probe=m_outputDirectory/(".write_probe_"+std::to_string(getpid()));
+        { std::ofstream out(probe); out.exceptions(std::ios::badbit|std::ios::failbit); out<<"ok"; out.close(); }
+        fs::remove(probe);
 
         RCLCPP_INFO(this->get_logger(), "------------------------------------------------------");
         RCLCPP_INFO(this->get_logger(), "Initializing DB-TSDF Node with Parameters:");
@@ -169,23 +225,26 @@ public:
         m_tfListener = std::make_shared<tf2_ros::TransformListener>(*m_tfBuffer);
 
         // Publishers
-        m_cloudPub = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud", 100);
+        m_cloudPub = this->create_publisher<sensor_msgs::msg::PointCloud2>("cloud", rclcpp::SensorDataQoS());
+        m_mapPub=create_publisher<sensor_msgs::msg::PointCloud2>("map_cloud",rclcpp::QoS(1).reliable().transient_local());
         m_gpsPub = this->create_publisher<sensor_msgs::msg::NavSatFix>(
             m_outGpsTopic, rclcpp::QoS(1).reliable().transient_local());
 
         // Subscriptions
-        auto qos_keepall_reliable = rclcpp::QoS(rclcpp::KeepAll()).reliable().durability_volatile();
+        auto input_qos = rclcpp::QoS(rclcpp::KeepLast(queueDepth));
+        if (reliability=="best_effort") input_qos.best_effort();
+        else input_qos.reliable();
 
         m_pcSub = this->create_subscription<sensor_msgs::msg::PointCloud2>(
             m_inCloudTopic,
-            qos_keepall_reliable,
+            input_qos,
             std::bind(&TSDFNode::pointcloudCallback, this, std::placeholders::_1));
 
         if (m_useTf && m_useTfTopic) {
             RCLCPP_INFO(this->get_logger(), "Using Legacy TF Mode: subscribing to '%s'", m_inTfTopic.c_str());
             m_tfSub = this->create_subscription<geometry_msgs::msg::TransformStamped>(
                 m_inTfTopic,
-                qos_keepall_reliable,
+                input_qos,
                 std::bind(&TSDFNode::tfCallback, this, std::placeholders::_1));
         } else if (m_useTf) {
             RCLCPP_INFO(this->get_logger(), "Using Generic TF Mode (listening to /tf)");
@@ -200,22 +259,22 @@ public:
                     "Subscribing to GPS topic '%s'; publishing valid fixes on '%s'",
                     m_inGpsTopic.c_str(), m_outGpsTopic.c_str());
 
-        save_service_pcd_ = this->create_service<std_srvs::srv::Trigger>("/save_grid_pcd",
+        save_service_pcd_ = this->create_service<std_srvs::srv::Trigger>("save_grid_pcd",
             std::bind(&TSDFNode::saveGridPCD, this, std::placeholders::_1, std::placeholders::_2));
 
-        save_service_ply_ = this->create_service<std_srvs::srv::Trigger>("/save_grid_ply",
+        save_service_ply_ = this->create_service<std_srvs::srv::Trigger>("save_grid_ply",
             std::bind(&TSDFNode::saveGridPLY, this, std::placeholders::_1, std::placeholders::_2));
 
-        save_service_csv_ = this->create_service<std_srvs::srv::Trigger>("/save_grid_csv",
+        save_service_csv_ = this->create_service<std_srvs::srv::Trigger>("save_grid_csv",
             std::bind(&TSDFNode::saveGridCSV, this, std::placeholders::_1, std::placeholders::_2));
 
-        save_service_mesh_ = this->create_service<std_srvs::srv::Trigger>("/save_grid_mesh",
+        save_service_mesh_ = this->create_service<std_srvs::srv::Trigger>("save_grid_mesh",
             std::bind(&TSDFNode::saveGridMesh, this, std::placeholders::_1, std::placeholders::_2));
 
-        save_service_atak_ = this->create_service<std_srvs::srv::Trigger>("/save_grid_atak_zip",
+        save_service_atak_ = this->create_service<std_srvs::srv::Trigger>("save_grid_atak_zip",
             std::bind(&TSDFNode::saveGridAtakZip, this, std::placeholders::_1, std::placeholders::_2));
 
-        get_geo_origin_service_ = this->create_service<std_srvs::srv::Trigger>("/get_geo_origin",
+        get_geo_origin_service_ = this->create_service<std_srvs::srv::Trigger>("get_geo_origin",
             std::bind(&TSDFNode::getGeoOrigin, this, std::placeholders::_1, std::placeholders::_2));
 
         // TDF grid allocation
@@ -230,7 +289,55 @@ public:
                        m_shadowRadius,
                        m_distanceMode,
                        m_tdfMaxCells,
-                       m_verboseInit);
+                       m_verboseInit, m_numThreads, m_capacityPolicy, m_memoryBudget);
+        m_grid3d.configureMesh(meshMode,meshSigma);
+        if (!m_initialCheckpoint.empty()) m_grid3d.loadCheckpoint(m_initialCheckpoint,frameSignature());
+        m_exports=std::make_unique<db_tsdf::ExportWorker>(2);
+        m_statusPublisher=create_publisher<std_msgs::msg::String>("~/status",rclcpp::QoS(1).transient_local());
+        m_statusService=create_service<std_srvs::srv::Trigger>("get_status",[this](std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr response) {
+            std::lock_guard lock(m_gridMutex);
+            response->success=true; response->message=metadataLocked().dump();
+        });
+        m_exportStatusService=create_service<std_srvs::srv::Trigger>("export_status",[this](std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr response) {
+            Json jobs=Json::array();
+            for (const auto& job : m_exports->statuses())
+                jobs.push_back({{"id",job.id},{"path",job.path},{"state",job.state},{"error",job.error}});
+            response->success=true; response->message=jobs.dump();
+        });
+        m_resetService=create_service<std_srvs::srv::Trigger>("reset_map",[this](std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr response) {
+            std::lock_guard lock(m_gridMutex);
+            m_grid3d.clear(); m_integrated=0; m_lastStamp=0; ++m_epoch;
+            m_received=0; m_tfFailures=0; m_invalidClouds=0; m_invalidPoints=0;
+            m_outsidePoints=0; m_skippedBlocks=0; m_rangeFiltered=0; m_subsampled=0;
+            m_legacyNearest=0; m_invalidTransforms=0; m_lastCallbackMs=0;
+            response->success=true; response->message="Map cleared; existing export snapshots are unchanged.";
+        });
+        m_checkpointService=create_service<std_srvs::srv::Trigger>("save_grid_checkpoint",[this](std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr response) {
+            queueExport("checkpoint",[this](auto& map,const fs::path& dir) {
+                map.saveCheckpoint((dir/"map.dbtsdf").string(),frameSignature());
+            },response);
+        });
+        m_previewService=create_service<std_srvs::srv::Trigger>("publish_map",[this](std_srvs::srv::Trigger::Request::SharedPtr, std_srvs::srv::Trigger::Response::SharedPtr response) {
+            const auto id=m_exports->enqueue("map_cloud",[this] {
+                Json metadata;
+                auto snapshot=takeSnapshot(metadata);
+                sensor_msgs::msg::PointCloud2 cloud;
+                pcl::toROSMsg(snapshot->grid().surfaceCloud(),cloud);
+                cloud.header.frame_id=m_fixedFrameId;
+                cloud.header.stamp=rclcpp::Time(metadata.at("last_stamp_ns").get<int64_t>(),RCL_ROS_TIME);
+                m_mapPub->publish(cloud);
+            });
+            response->success=id!=0;
+            response->message=Json({{"job_id",id},{"state",id?"queued":"busy"}}).dump();
+        });
+        m_statusTimer=create_wall_timer(std::chrono::seconds(1),[this] {
+            std_msgs::msg::String message;
+            { std::lock_guard lock(m_gridMutex); message.data=metadataLocked().dump(); }
+            m_statusPublisher->publish(message);
+        });
+        RCLCPP_INFO(get_logger(),"Grid capacity: %.1f MiB; initial allocation: %.1f MiB; workers: %d; policy: %s",
+            m_grid3d.grid().estimatedBytes()/1048576.0,m_grid3d.grid().allocatedBytes()/1048576.0,
+            m_grid3d.threadCount(),m_capacityPolicy.c_str());
 
         RCLCPP_INFO(this->get_logger(),
             "DB-TSDF is ready! Grid: %.1f x %.1f x %.1f m @ %.3f m/voxel",
@@ -241,12 +348,7 @@ public:
     }
 
     ~TSDFNode() override {
-        std::lock_guard<std::mutex> lock(m_exportThreadsMutex);
-        for (auto &worker : m_exportThreads) {
-            if (worker.joinable()) {
-                worker.join();
-            }
-        }
+        if (m_exports) m_exports->shutdown();
         RCLCPP_INFO(this->get_logger(), "Node closed successfully.");
     }
 
@@ -257,7 +359,9 @@ private:
                std::isfinite(fix.latitude) && std::isfinite(fix.longitude) &&
                std::isfinite(fix.altitude) &&
                fix.latitude >= -90.0 && fix.latitude <= 90.0 &&
-               fix.longitude >= -180.0 && fix.longitude <= 180.0;
+               fix.longitude >= -180.0 && fix.longitude <= 180.0 &&
+               std::all_of(fix.position_covariance.begin(),fix.position_covariance.end(),
+                   [](double v){return std::isfinite(v);});
     }
 
     static void validateGeoOrigin(const GeoOrigin &origin)
@@ -350,16 +454,88 @@ private:
         return json.str();
     }
 
-    void startExport(std::function<void()> job)
-    {
-        std::lock_guard<std::mutex> lock(m_exportThreadsMutex);
-        m_exportThreads.emplace_back([this, job = std::move(job)]() mutable {
-            // Services use fixed output names. Serializing exports prevents
-            // simultaneous requests from interleaving their OBJ/sidecar/ZIP
-            // files while m_gridMutex protects the TSDF itself.
-            std::lock_guard<std::mutex> export_lock(m_exportMutex);
-            job();
+    std::string frameSignature() const {
+        return m_fixedFrameId+"\n"+(m_geoOrigin.configured ? geoReferenceJson(std::nullopt) : "local");
+    }
+    Json metadataLocked() const {
+        Json parameters=Json::object();
+        for (const auto& name : list_parameters({},10).names) {
+            const auto p=get_parameter(name);
+            switch (p.get_type()) {
+                case rclcpp::ParameterType::PARAMETER_BOOL: parameters[name]=p.as_bool(); break;
+                case rclcpp::ParameterType::PARAMETER_INTEGER: parameters[name]=p.as_int(); break;
+                case rclcpp::ParameterType::PARAMETER_DOUBLE: parameters[name]=p.as_double(); break;
+                case rclcpp::ParameterType::PARAMETER_STRING: parameters[name]=p.as_string(); break;
+                default: parameters[name]=p.value_to_string();
+            }
+        }
+        const auto& grid=m_grid3d.grid();
+        return {{"schema","db-tsdf-run/v1"},{"ready",true},{"mask_bits",DB_TSDF_MASK_BITS},
+            {"source_sha256",DB_TSDF_SOURCE_SHA256},{"git_revision",DB_TSDF_GIT_REVISION},
+            {"compiler",__VERSION__},{"build_type",DB_TSDF_BUILD_TYPE},{"build",db_tsdf::buildInfo()},
+            {"fixed_frame",m_fixedFrameId},{"input_topic",m_pcSub->get_topic_name()},{"map_epoch",m_epoch},
+            {"parameters",parameters},{"num_threads",m_grid3d.threadCount()},
+            {"received_frames",m_received.load()},{"integrated_frames",m_integrated},
+            {"tf_failures",m_tfFailures.load()},{"invalid_clouds",m_invalidClouds.load()},
+            {"invalid_points",m_invalidPoints.load()},{"outside_points",m_outsidePoints},
+            {"range_filtered_points",m_rangeFiltered.load()},{"subsampled_points",m_subsampled.load()},
+            {"invalid_transforms",m_invalidTransforms.load()},{"legacy_nearest_frames",m_legacyNearest.load()},
+            {"skipped_blocks",m_skippedBlocks},{"last_stamp_ns",m_lastStamp},
+            {"last_callback_ms",m_lastCallbackMs.load()},
+            {"allocated_blocks",grid.activeCount()},{"capacity_blocks",grid.capacity()},
+            {"allocated_bytes",grid.allocatedBytes()},{"capacity_bytes",grid.estimatedBytes()},
+            {"evictions",grid.evictions()},{"rejected_blocks",grid.rejectedBlocks()}};
+    }
+    std::unique_ptr<TSDFBackend> takeSnapshot(Json& metadata) {
+        std::lock_guard lock(m_gridMutex);
+        if (m_snapshotBudget>0 && m_grid3d.grid().allocatedBytes()/1048576.0>m_snapshotBudget)
+            throw std::runtime_error("export snapshot exceeds snapshot_budget_mb");
+        auto snapshot=std::make_unique<TSDFBackend>(m_grid3d);
+        metadata=metadataLocked();
+        return snapshot;
+    }
+    void queueExport(const std::string& label,
+                     std::function<void(TSDFBackend&,const fs::path&)> action,
+                     const std::shared_ptr<std_srvs::srv::Trigger::Response>& response) {
+        const auto stamp=std::chrono::system_clock::now().time_since_epoch().count();
+        const auto path=m_outputDirectory/(label+"_"+std::to_string(stamp)+"_"+std::to_string(++m_exportCounter));
+        const auto id=m_exports->enqueue(path.string(),[this,path,action=std::move(action)] {
+            Json metadata;
+            auto snapshot=takeSnapshot(metadata);
+            metadata["state_hash"]=snapshot->grid().stateHash();
+            const auto staging=fs::path(path.string()+".partial");
+            if (!fs::create_directory(staging)) throw std::runtime_error("export staging path already exists");
+            try {
+                action(*snapshot,staging);
+                metadata["outputs_sha256"]=db_tsdf::fileChecksums(staging);
+                std::ofstream out(staging/"run.json");
+                out.exceptions(std::ios::badbit|std::ios::failbit);
+                out << metadata.dump(2) << '\n'; out.close();
+                fs::rename(staging,path);
+                RCLCPP_INFO(get_logger(),"Export complete: %s",path.c_str());
+            } catch (...) {
+                std::error_code error; fs::remove_all(staging,error); throw;
+            }
         });
+        response->success=id!=0;
+        response->message=Json({{"job_id",id},{"path",path.string()},
+            {"state",id ? "queued" : "busy"}}).dump();
+    }
+    static void zipFiles(const fs::path& directory) {
+        std::vector<std::string> args{"zip","-j","-q",(directory/"atak_mesh.zip").string()};
+        for (const char* file : {"atak_mesh.obj","atak_mesh.mtl","atak_mesh.origin.json"})
+            args.push_back((directory/file).string());
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        argv.push_back(nullptr);
+        pid_t pid;
+        const int error=posix_spawnp(&pid,"zip",nullptr,nullptr,argv.data(),environ);
+        if (error) throw std::runtime_error("could not start zip: "+std::to_string(error));
+        int status;
+        while (waitpid(pid,&status,0)<0) {
+            if (errno!=EINTR) throw std::runtime_error("could not wait for zip");
+        }
+        if (!WIFEXITED(status) || WEXITSTATUS(status)!=0) throw std::runtime_error("zip export failed");
     }
 
     static std::string normalizeColorScheme(std::string scheme)
@@ -413,13 +589,25 @@ private:
     std::deque<geometry_msgs::msg::TransformStamped> m_tfHist;
     rclcpp::Duration m_maxSkew{0, 100'000'000};
     std::mutex m_tfMutex;
-    std::mutex m_exportMutex;
-    std::mutex m_exportThreadsMutex;
-    std::vector<std::thread> m_exportThreads;
+    std::unique_ptr<db_tsdf::ExportWorker> m_exports;
+    int m_numThreads{0};
+    std::string m_capacityPolicy,m_sensorFrame,m_initialCheckpoint;
+    fs::path m_outputDirectory;
+    double m_memoryBudget{0},m_snapshotBudget{0},m_tfTimeout{0.1};
+    bool m_publishCloud{true},m_allowLatestTf{false},m_legacyAllowNearest{true};
+    std::atomic<uint64_t> m_received{0},m_tfFailures{0},m_invalidClouds{0},m_invalidPoints{0};
+    std::atomic<uint64_t> m_rangeFiltered{0},m_subsampled{0},m_legacyNearest{0},m_invalidTransforms{0};
+    std::atomic<double> m_lastCallbackMs{0};
+    uint64_t m_integrated{0},m_outsidePoints{0},m_skippedBlocks{0},m_exportCounter{0},m_epoch{0};
+    int64_t m_lastStamp{0};
+    pcl::PointCloud<pcl::PointXYZ> m_pclInput,m_pclFiltered,m_pclOutput;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr m_statusPublisher;
+    rclcpp::TimerBase::SharedPtr m_statusTimer;
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr m_statusService,m_exportStatusService,m_resetService,m_checkpointService,m_previewService;
 
     // ROS interfaces
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr m_pcSub;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_cloudPub;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr m_cloudPub,m_mapPub;
     rclcpp::Subscription<geometry_msgs::msg::TransformStamped>::SharedPtr m_tfSub;
     rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr m_gpsSub;
     rclcpp::Publisher<sensor_msgs::msg::NavSatFix>::SharedPtr m_gpsPub;
@@ -458,48 +646,80 @@ private:
 void TSDFNode::pointcloudCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& cloud)
 {
     auto start = std::chrono::steady_clock::now();
-    static size_t counter = 0;
-    counter++;
+    ++m_received;
+    if (cloud->width==0 || cloud->height==0 || cloud->header.stamp.sec<0 || cloud->header.stamp.nanosec>=1000000000) {
+        ++m_invalidClouds; return;
+    }
+    for (const char* name : {"x","y","z"}) {
+        const auto field=std::find_if(cloud->fields.begin(),cloud->fields.end(),
+            [&](const auto& f){return f.name==name;});
+        if (field==cloud->fields.end() || field->datatype!=sensor_msgs::msg::PointField::FLOAT32 ||
+            field->count!=1 || static_cast<uint64_t>(field->offset)+4>cloud->point_step) {
+            ++m_invalidClouds;
+            RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),5000,"Input must contain float32 XYZ fields");
+            return;
+        }
+    }
+    if (cloud->is_bigendian || static_cast<uint64_t>(cloud->width)*cloud->point_step>cloud->row_step ||
+        static_cast<uint64_t>(cloud->height)*cloud->row_step>cloud->data.size()) {
+        ++m_invalidClouds; return;
+    }
 
     Eigen::Matrix4f T = Eigen::Matrix4f::Identity();
 
     rclcpp::Time t_query = cloud->header.stamp;
-    if (t_query.nanoseconds() == 0) {
+    if (m_useTf && t_query.nanoseconds() == 0) {
+        if (!m_allowLatestTf) {
+            ++m_tfFailures;
+            RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),5000,"Zero cloud stamp rejected; timestamp the cloud or explicitly allow_latest_tf");
+            return;
+        }
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
             "Cloud timestamp is 0. Using latest available transform (rclcpp::Time(0)).");
-        t_query = rclcpp::Time(0);
+        t_query = rclcpp::Time(0,0,RCL_ROS_TIME);
     }
 
     if (m_useTf) {
         if (m_useTfTopic) {
             std::lock_guard<std::mutex> lock(m_tfMutex);
             if (m_tfHist.empty()) {
+                ++m_tfFailures;
                 RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
                                      "No TF received yet on LEGACY topic %s -> discarding cloud",
                                      m_inTfTopic.c_str());
                 return;
             }
 
-            auto best_it = m_tfHist.begin();
-            auto best_dt = rclcpp::Duration::from_nanoseconds(
-                std::llabs((t_query - best_it->header.stamp).nanoseconds()));
-
-            for (auto it = std::next(m_tfHist.begin()); it != m_tfHist.end(); ++it) {
-                auto dt = rclcpp::Duration::from_nanoseconds(
-                    std::llabs((t_query - it->header.stamp).nanoseconds()));
-                if (dt < best_dt) {
-                    best_dt = dt;
-                    best_it = it;
+            try {
+                const auto stamp=t_query.nanoseconds();
+                auto after=std::lower_bound(m_tfHist.begin(),m_tfHist.end(),stamp,[](const auto& tf,int64_t t) {
+                    return rclcpp::Time(tf.header.stamp).nanoseconds()<t;
+                });
+                if (stamp==0 && m_allowLatestTf) T=getTransformMatrix(m_tfHist.back());
+                else if (after!=m_tfHist.end() && rclcpp::Time(after->header.stamp).nanoseconds()==stamp)
+                    T=getTransformMatrix(*after);
+                else if (after!=m_tfHist.begin() && after!=m_tfHist.end()) {
+                    const auto before=std::prev(after);
+                    const auto t0=rclcpp::Time(before->header.stamp).nanoseconds();
+                    const auto t1=rclcpp::Time(after->header.stamp).nanoseconds();
+                    if (stamp-t0>m_maxSkew.nanoseconds() || t1-stamp>m_maxSkew.nanoseconds())
+                        throw std::runtime_error("legacy TF interpolation gap exceeds legacy_max_skew");
+                    const float alpha=double(stamp-t0)/double(t1-t0);
+                    const auto a=getTransformMatrix(*before),b=getTransformMatrix(*after);
+                    T.block<3,1>(0,3)=(1-alpha)*a.block<3,1>(0,3)+alpha*b.block<3,1>(0,3);
+                    const Eigen::Quaternionf qa(a.block<3,3>(0,0)),qb(b.block<3,3>(0,0));
+                    T.block<3,3>(0,0)=qa.slerp(alpha,qb).normalized().toRotationMatrix();
+                } else {
+                    const auto& nearest=after==m_tfHist.end()?m_tfHist.back():*after;
+                    if (!m_legacyAllowNearest || std::llabs(stamp-rclcpp::Time(nearest.header.stamp).nanoseconds())>m_maxSkew.nanoseconds())
+                        throw std::runtime_error("no timestamp-matched legacy TF available");
+                    T=getTransformMatrix(nearest); ++m_legacyNearest;
                 }
-            }
-
-            if (best_dt > m_maxSkew) {
-                RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-                                     "Best legacy TF deltaT (%.3f ms) > max_skew -> discarding cloud",
-                                     best_dt.seconds() * 1e3);
+            } catch (const std::exception& error) {
+                ++m_tfFailures;
+                RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),2000,"Legacy TF rejected: %s",error.what());
                 return;
             }
-            T = getTransformMatrix(*best_it);
 
         } else {
             try {
@@ -508,10 +728,11 @@ void TSDFNode::pointcloudCallback(const sensor_msgs::msg::PointCloud2::ConstShar
                     m_fixedFrameId,
                     cloud->header.frame_id,
                     t_query,
-                    rclcpp::Duration(0, 100000000)
+                    rclcpp::Duration::from_seconds(m_tfTimeout)
                 );
                 T = getTransformMatrix(tf_msg);
-            } catch (const tf2::TransformException &ex) {
+            } catch (const std::exception &ex) {
+                ++m_tfFailures;
                 RCLCPP_WARN_THROTTLE(
                     this->get_logger(), *this->get_clock(), 2000,
                     "Could not transform %s to fixed frame %s: %s",
@@ -522,54 +743,69 @@ void TSDFNode::pointcloudCallback(const sensor_msgs::msg::PointCloud2::ConstShar
         }
     }
 
-    pcl::PointCloud<pcl::PointXYZ> pcl_in;
-    pcl::fromROSMsg(*cloud, pcl_in);
-
-    pcl::PointCloud<pcl::PointXYZ> pcl_filtered;
-    pcl_filtered.reserve(pcl_in.size());
-
-    const double min_sq = m_minRange * m_minRange;
-    const double max_sq = m_maxRange * m_maxRange;
-    int cnt = 0;
-
-    for (const auto &p : pcl_in) {
-        const double d2 = p.x*p.x + p.y*p.y + p.z*p.z;
-        if (d2 < min_sq || d2 > max_sq) continue;
-        if (cnt++ % m_PcDownsampling) continue;
-        pcl_filtered.points.push_back(p);
+    Eigen::Vector3f sensor_position=T.block<3,1>(0,3);
+    if (!m_sensorFrame.empty()) {
+        try {
+            const auto sensor_tf=m_tfBuffer->lookupTransform(m_fixedFrameId,m_sensorFrame,t_query,
+                rclcpp::Duration::from_seconds(m_tfTimeout));
+            sensor_position=getTransformMatrix(sensor_tf).block<3,1>(0,3);
+        } catch(const std::exception& e) {
+            ++m_tfFailures;
+            RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),5000,"Missing sensor origin TF: %s",e.what());
+            return;
+        }
     }
-
-    pcl_filtered.width = pcl_filtered.points.size();
-    pcl_filtered.height = 1;
-    pcl_filtered.is_dense = true;
-
-    pcl::PointCloud<pcl::PointXYZ> pcl_out;
-    pcl::transformPointCloud(pcl_filtered, pcl_out, T);
-
-    std::vector<pcl::PointXYZ> pts_global(pcl_out.points.begin(), pcl_out.points.end());
-    Eigen::Vector3f sensor_position = T.block<3,1>(0,3);
+    const Eigen::Vector3f sensor_in_cloud=T.block<3,3>(0,0).transpose()*(sensor_position-T.block<3,1>(0,3));
+    pcl::fromROSMsg(*cloud,m_pclInput);
+    m_pclFiltered.clear(); m_pclFiltered.reserve(m_pclInput.size());
+    const double min_sq=m_minRange*m_minRange, max_sq=m_maxRange*m_maxRange;
+    size_t count=0;
+    for (const auto& p : m_pclInput) {
+        const Eigen::Vector3f ray=Eigen::Vector3f(p.x,p.y,p.z)-sensor_in_cloud;
+        if (!ray.allFinite()) { ++m_invalidPoints; continue; }
+        const double distance=ray.cast<double>().squaredNorm();
+        if (distance<=1e-12 || distance<min_sq || distance>max_sq) { ++m_rangeFiltered; continue; }
+        if (count++ % m_PcDownsampling) { ++m_subsampled; continue; }
+        m_pclFiltered.push_back(p);
+    }
+    pcl::transformPointCloud(m_pclFiltered,m_pclOutput,T);
     {
-        std::lock_guard<std::mutex> lock(m_gridMutex);
-        m_grid3d.loadCloud(pts_global, sensor_position);
+        std::lock_guard lock(m_gridMutex);
+        m_grid3d.loadCloud(std::span<const pcl::PointXYZ>(m_pclOutput.points.data(),m_pclOutput.size()),sensor_position);
+        ++m_integrated;
+        m_lastStamp=rclcpp::Time(cloud->header.stamp).nanoseconds();
+        m_outsidePoints+=m_grid3d.lastIntegration().outside_points;
+        m_skippedBlocks+=m_grid3d.lastIntegration().skipped_blocks;
+        if (m_grid3d.lastIntegration().skipped_blocks)
+            RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),5000,"Map capacity reached; inspect get_status skipped_blocks/evictions");
     }
-
-    sensor_msgs::msg::PointCloud2 cloud_corrected;
-    pcl::toROSMsg(pcl_out, cloud_corrected);
-    cloud_corrected.header = cloud->header;
-    cloud_corrected.header.frame_id = m_fixedFrameId;
-    m_cloudPub->publish(cloud_corrected);
-
-    auto end = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double,std::milli>(end - start).count();
-    RCLCPP_INFO(this->get_logger(), "Received frame #%zu · time = %.3f ms", counter, ms);
+    if (m_publishCloud && m_cloudPub->get_subscription_count()) {
+        sensor_msgs::msg::PointCloud2 corrected;
+        pcl::toROSMsg(m_pclOutput,corrected);
+        corrected.header=cloud->header; corrected.header.frame_id=m_fixedFrameId;
+        m_cloudPub->publish(corrected);
+    }
+    m_lastCallbackMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+    RCLCPP_DEBUG(get_logger(),"Integrated frame; callback %.3f ms",m_lastCallbackMs.load());
 }
 
 void TSDFNode::tfCallback(geometry_msgs::msg::TransformStamped::ConstSharedPtr msg)
 {
+    if (msg->header.stamp.sec<0 || msg->header.stamp.nanosec>=1000000000) { ++m_invalidTransforms; return; }
+    try { (void)getTransformMatrix(*msg); }
+    catch(const std::exception& error) {
+        ++m_invalidTransforms;
+        RCLCPP_WARN_THROTTLE(get_logger(),*get_clock(),2000,"Invalid legacy TF: %s",error.what());
+        return;
+    }
     std::lock_guard<std::mutex> lock(m_tfMutex);
-    m_tfHist.push_back(*msg);
-    while (m_tfHist.size() > 100)
-        m_tfHist.pop_front();
+    const auto stamp=rclcpp::Time(msg->header.stamp).nanoseconds();
+    auto position=std::lower_bound(m_tfHist.begin(),m_tfHist.end(),stamp,[](const auto& tf,int64_t t) {
+        return rclcpp::Time(tf.header.stamp).nanoseconds()<t;
+    });
+    if (position!=m_tfHist.end() && rclcpp::Time(position->header.stamp).nanoseconds()==stamp) *position=*msg;
+    else m_tfHist.insert(position,*msg);
+    while (m_tfHist.size()>100) m_tfHist.pop_front();
 }
 
 void TSDFNode::gpsCallback(sensor_msgs::msg::NavSatFix::ConstSharedPtr msg)
@@ -600,13 +836,16 @@ Eigen::Matrix4f TSDFNode::getTransformMatrix(const geometry_msgs::msg::Transform
 {
     Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
 
-    Eigen::Quaternionf q(
+    Eigen::Quaterniond q(
         transform_stamped.transform.rotation.w,
         transform_stamped.transform.rotation.x,
         transform_stamped.transform.rotation.y,
         transform_stamped.transform.rotation.z
     );
-    Eigen::Matrix3f rotation = q.toRotationMatrix();
+    if (!q.coeffs().allFinite() || !std::isfinite(q.norm()) || q.norm()<1e-9)
+        throw std::invalid_argument("TF quaternion must be finite and nonzero");
+    q.normalize();
+    Eigen::Matrix3f rotation = q.toRotationMatrix().cast<float>();
 
     Eigen::Vector3f translation(
         transform_stamped.transform.translation.x,
@@ -614,146 +853,43 @@ Eigen::Matrix4f TSDFNode::getTransformMatrix(const geometry_msgs::msg::Transform
         transform_stamped.transform.translation.z
     );
 
+    if (!translation.allFinite()) throw std::invalid_argument("TF translation must be finite");
     transform.block<3,3>(0,0) = rotation;
     transform.block<3,1>(0,3) = translation;
 
     return transform;
 }
 
-// ros2 service call /save_grid_pcd std_srvs/srv/Trigger
 void TSDFNode::saveGridPCD(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-                           std::shared_ptr<std_srvs::srv::Trigger::Response> response)
-{
-    RCLCPP_INFO(this->get_logger(), "Exporting grid to PCD (grid_data.pcd)...");
-    startExport([this]() {
-        try {
-            std::lock_guard<std::mutex> lock(m_gridMutex);
-            m_grid3d.exportGridToPCD("grid_data.pcd", 1);
-            RCLCPP_INFO(this->get_logger(), "PCD export finished: grid_data.pcd");
-        } catch (const std::exception &e) {
-            RCLCPP_ERROR(this->get_logger(), "PCD export failed: %s", e.what());
-        }
-    });
-
-    response->success = true;
-    response->message = "PCD export started in the background.";
+                          std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+    queueExport("pcd",[](auto& map,const fs::path& dir){map.exportGridToPCD((dir/"grid_data.pcd").string(),1);},response);
 }
-
-// ros2 service call /save_grid_ply std_srvs/srv/Trigger
 void TSDFNode::saveGridPLY(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-                           std::shared_ptr<std_srvs::srv::Trigger::Response> response)
-{
-    RCLCPP_INFO(this->get_logger(), "Exporting grid to PLY (grid_data.ply)...");
-    startExport([this]() {
-        try {
-            std::lock_guard<std::mutex> lock(m_gridMutex);
-            m_grid3d.exportGridToPLY("grid_data.ply", 1);
-            RCLCPP_INFO(this->get_logger(), "PLY export finished: grid_data.ply");
-        } catch (const std::exception &e) {
-            RCLCPP_ERROR(this->get_logger(), "PLY export failed: %s", e.what());
-        }
-    });
-
-    response->success = true;
-    response->message = "PLY export started in the background.";
+                          std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+    queueExport("ply",[](auto& map,const fs::path& dir){map.exportGridToPLY((dir/"grid_data.ply").string(),1);},response);
 }
-
-// ros2 service call /save_grid_csv std_srvs/srv/Trigger
 void TSDFNode::saveGridCSV(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-                           std::shared_ptr<std_srvs::srv::Trigger::Response> response)
-{
-    RCLCPP_INFO(this->get_logger(), "Exporting subgrid cells to CSV (grid_data_csv/)...");
-    startExport([this]() {
-        try {
-            std::lock_guard<std::mutex> lock(m_gridMutex);
-            m_grid3d.exportSubgridToCSV("grid_data_csv", 1);
-            RCLCPP_INFO(this->get_logger(), "CSV export finished: grid_data_csv/");
-        } catch (const std::exception &e) {
-            RCLCPP_ERROR(this->get_logger(), "CSV export failed: %s", e.what());
-        }
-    });
-
-    response->success = true;
-    response->message = "CSV export started in the background.";
+                          std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+    queueExport("csv",[](auto& map,const fs::path& dir){map.exportSubgridToCSV((dir/"grid_data_csv").string(),1);},response);
 }
-
-// ros2 service call /save_grid_mesh std_srvs/srv/Trigger
 void TSDFNode::saveGridMesh(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-                            std::shared_ptr<std_srvs::srv::Trigger::Response> response)
-{
-    constexpr float iso = 0.0f;
-    RCLCPP_INFO(this->get_logger(), "Exporting grid to mesh (mesh.stl, iso=%.3f)...", iso);
-    startExport([this, iso]() {
-        try {
-            std::lock_guard<std::mutex> lock(m_gridMutex);
-            m_grid3d.exportMesh("mesh.stl", iso);
-            RCLCPP_INFO(this->get_logger(), "Mesh export finished: mesh.stl");
-        } catch (const std::exception &e) {
-            RCLCPP_ERROR(this->get_logger(), "Mesh export failed: %s", e.what());
-        }
-    });
-
-    response->success = true;
-    response->message = "Mesh export started in the background.";
+                           std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
+    queueExport("mesh",[](auto& map,const fs::path& dir){map.exportMesh((dir/"mesh.stl").string(),0);},response);
 }
-
-// ros2 service call /save_grid_atak_zip std_srvs/srv/Trigger
 void TSDFNode::saveGridAtakZip(const std::shared_ptr<std_srvs::srv::Trigger::Request>,
-                               std::shared_ptr<std_srvs::srv::Trigger::Response> response)
-{
-    constexpr float iso = 0.0f;
-
+                             std::shared_ptr<std_srvs::srv::Trigger::Response> response) {
     if (!m_geoOrigin.configured) {
-        response->success = false;
-        response->message =
-            "Geo-referenced export requires geo_origin_configured=true with the WGS-84/ENU datum "
-            "used by robot_localization.";
+        response->success=false;
+        response->message="Geo-referenced export requires an explicit WGS-84/ENU datum.";
         return;
     }
-
-    std::string colorScheme = normalizeColorScheme(this->get_parameter("color_scheme").as_string());
-    int colorBins = this->get_parameter("color_bins").as_int();
-    if (colorBins < 1) colorBins = 1;
-    const std::string geoReference = geoReferenceJson(latestGpsSnapshot());
-
-    RCLCPP_INFO(this->get_logger(),
-                "Exporting ATAK OBJ package (atak_mesh.obj/.mtl/.zip, scheme=%s, bins=%d, iso=%.3f)...",
-                colorScheme.c_str(), colorBins, iso);
-
-    startExport([this, colorScheme, colorBins, iso, geoReference]() {
-        const std::string base = "atak_mesh";
-        const std::string objFile = base + ".obj";
-        const std::string mtlFile = base + ".mtl";
-        const std::string zipFile = base + ".zip";
-        const std::string originFile = base + ".origin.json";
-
-        try {
-            {
-                std::lock_guard<std::mutex> lock(m_gridMutex);
-                m_grid3d.exportMeshOBJ(base, iso, colorScheme, colorBins);
-            }
-
-            std::ofstream ofs(originFile);
-            if (!ofs.is_open()) {
-                throw std::runtime_error("could not open geo-reference sidecar for writing");
-            }
-            ofs << geoReference << '\n';
-            ofs.close();
-
-            const std::string zipCmd = "zip -j -q " + zipFile + " " + objFile + " " + mtlFile + " " + originFile;
-            int rc = std::system(zipCmd.c_str());
-            if (rc != 0) {
-                throw std::runtime_error("zip command failed with exit code " + std::to_string(rc));
-            }
-
-            RCLCPP_INFO(this->get_logger(), "Geo-referenced OBJ package export finished: %s", zipFile.c_str());
-        } catch (const std::exception &e) {
-            RCLCPP_ERROR(this->get_logger(), "Geo-referenced OBJ package export failed: %s", e.what());
-        }
-    });
-
-    response->success = true;
-    response->message = "Geo-referenced OBJ export queued in the background.";
+    queueExport("atak",[this](auto& map,const fs::path& dir) {
+        map.exportMeshOBJ((dir/"atak_mesh").string(),0,m_colorScheme,m_colorBins);
+        std::ofstream origin(dir/"atak_mesh.origin.json");
+        origin.exceptions(std::ios::badbit|std::ios::failbit);
+        origin << geoReferenceJson(latestGpsSnapshot()) << '\n'; origin.close();
+        zipFiles(dir);
+    },response);
 }
 
 // Returns the immutable WGS-84/ENU datum used for the map frame, plus the
@@ -781,6 +917,8 @@ int main(int argc, char **argv)
         rclcpp::spin(node);
     } catch (const std::exception &e) {
         std::cerr << "Error creating or running the node: " << e.what() << std::endl;
+        rclcpp::shutdown();
+        return 1;
     }
 
     rclcpp::shutdown();

@@ -17,7 +17,8 @@
 #include <string>
 #include <vector>
 
-#include <db_tsdf/mask.hpp>
+#include <db_tsdf/volume.hpp>
+#include <vtkCleanPolyData.h>
 
 // PCL
 #include <pcl/point_cloud.h>
@@ -37,16 +38,6 @@
 #include <vtkPolyData.h>
 #include <vtkPoints.h>
 #include <vtkCellArray.h>
-
-template <db_tsdf::SupportedMask Mask>
-struct VoxelDataT
-{
-    Mask d;          // Bit-count encodes the truncated distance rank
-    uint8_t s;       // bit0: sign (0 occ / 1 free)
-    uint8_t hits;    // hit counter
-};
-static_assert(sizeof(VoxelDataT<uint16_t>) == 4, "16-bit voxel layout must occupy 4 bytes");
-static_assert(sizeof(VoxelDataT<uint32_t>) == 8, "32-bit voxel layout must occupy 8 bytes");
 
 inline std::array<float,3> grid_colormap_grayscale(float t)
 {
@@ -91,485 +82,155 @@ inline std::array<float,3> grid_apply_colormap(const std::string& scheme, float 
 }
 
 template <db_tsdf::SupportedMask Mask>
-class Grid
-{
+class Grid : public Volume<Mask> {
 public:
+    using Base = Volume<Mask>;
+    using typename Base::VoxelData;
+    using typename Base::Index;
+    static constexpr int mask_bits = Base::mask_bits;
 
-    using VoxelData = VoxelDataT<Mask>;
-    static constexpr int mask_bits = db_tsdf::mask_bits_v<Mask>;
-
-    struct Iterator
-    {
-        Iterator(Grid* parent, VoxelData **grid, uint32_t i, uint32_t base, uint32_t j, uint32_t cellSizeX)
-        {
-            _parent = parent;
-            _grid = grid;
-            _i = i;
-            _j = j;
-            _base = base;
-            _cellSizeX = cellSizeX;
-            _curr = _grid[_i];
-        }
-
-        Iterator& operator=(const Iterator &it)
-        {
-            _grid = it._grid;
-            _i = it._i;
-            _j = it._j;
-            _base = it._base;
-            _cellSizeX = it._cellSizeX;
-            _curr = it._curr;
-            return *this;
-        }
-
-        VoxelData &operator*() {
-            if (_curr == _parent->_dummy) {
-                return _parent->_garbage;
+    void configureMesh(const std::string& mode, double sigma = -1) {
+        if (mode != "occupancy" && mode != "distance")
+            throw std::invalid_argument("mesh_mode must be occupancy or distance");
+        if (!std::isfinite(sigma) || (sigma < 0 && sigma != -1) || sigma > 5)
+            throw std::invalid_argument("mesh_smoothing_sigma must be -1 (auto) or 0..5 voxels");
+        _meshMode = mode;
+        _sigma = sigma < 0 ? (mode == "occupancy" ? 1.0 : 0.0) : sigma;
+    }
+    void setRankDistances(std::vector<double> distances) { _rankDistances = std::move(distances); }
+    double metricDistance(Mask mask) const {
+        const size_t rank = db_tsdf::maskRank(mask);
+        return rank < _rankDistances.size() ? _rankDistances[rank] : rank*this->resolution();
+    }
+    pcl::PointCloud<pcl::PointXYZ> surfaceCloud(int subsampling = 1) const {
+        pcl::PointCloud<pcl::PointXYZ> cloud;
+        const int step = std::max(1,subsampling);
+        this->visit([&](const Index& p, const VoxelData& v) {
+            if (p[0]%step || p[1]%step || p[2]%step || (v.s&1) || !(v.s&2) || db_tsdf::maskRank(v.d)>1)
+                return;
+            const auto c = this->center(p);
+            cloud.push_back(pcl::PointXYZ(c[0],c[1],c[2]));
+        });
+        return cloud;
+    }
+    void exportGridToPCD(const std::string& filename, int subsampling) const {
+        auto cloud = surfaceCloud(subsampling);
+        if (cloud.empty()) throw std::runtime_error("PCD export: map has no occupied surface");
+        if (pcl::io::savePCDFileBinary(filename,cloud) != 0)
+            throw std::runtime_error("PCD writer failed: " + filename);
+    }
+    void exportGridToPLY(const std::string& filename, int subsampling) const {
+        auto cloud = surfaceCloud(subsampling);
+        if (cloud.empty()) throw std::runtime_error("PLY export: map has no occupied surface");
+        if (pcl::io::savePLYFileBinary(filename,cloud) != 0)
+            throw std::runtime_error("PLY writer failed: " + filename);
+    }
+    void exportSubgridToCSV(const std::string& directory, int subsampling) const {
+        if (!this->activeCount()) throw std::runtime_error("CSV export: map is empty");
+        std::filesystem::create_directories(directory);
+        const int step = std::max(1,subsampling);
+        for (auto id : this->activeBlocks()) {
+            std::ofstream out(std::filesystem::path(directory)/("block_"+std::to_string(id)+".csv"));
+            out.exceptions(std::ios::badbit | std::ios::failbit);
+            out << "x,y,z,distance_rank,distance_m,free,observed,hits\n" << std::setprecision(9);
+            const auto origin = this->blockOrigin(id);
+            for (int z=0;z<this->blockSide();z+=step)
+            for (int y=0;y<this->blockSide();y+=step)
+            for (int x=0;x<this->blockSide();x+=step) {
+                const Index p{origin[0]+x,origin[1]+y,origin[2]+z};
+                if (!this->valid(p)) continue;
+                const auto v = this->readIndex(p);
+                const auto c = this->center(p);
+                out << c[0]<<','<<c[1]<<','<<c[2]<<','<<db_tsdf::maskRank(v.d)<<','
+                    <<metricDistance(v.d)<<','<<int(v.s&1)<<','<<int((v.s&2)!=0)<<','<<int(v.hits)<<'\n';
             }
-            return _curr[_j+_base];
+            out.close();
         }
+    }
 
-        VoxelData *operator->() {
-            if (_curr == _parent->_dummy) {
-                return &(_parent->_garbage);
+    vtkSmartPointer<vtkPolyData> buildSurfaceMesh(float iso_level, int occ_min_hits) {
+        auto appender = vtkSmartPointer<vtkAppendPolyData>::New();
+        const int side = this->blockSide();
+        const int halo = static_cast<int>(std::ceil(3*_sigma));
+        const int dim = side+1+2*halo;
+        const double res = this->resolution();
+        for (auto id : this->activeBlocks()) {
+            const auto origin = this->blockOrigin(id);
+            auto image = vtkSmartPointer<vtkImageData>::New();
+            image->SetDimensions(dim,dim,dim);
+            image->SetSpacing(res,res,res);
+            const auto first = this->center({origin[0]-halo,origin[1]-halo,origin[2]-halo});
+            image->SetOrigin(first.data());
+            image->AllocateScalars(VTK_FLOAT,1);
+            auto* dest = static_cast<float*>(image->GetScalarPointer());
+            bool occupied = false;
+            for (int z=0;z<dim;++z)
+            for (int y=0;y<dim;++y)
+            for (int x=0;x<dim;++x) {
+                const auto v = this->readIndex({origin[0]+x-halo,origin[1]+y-halo,origin[2]+z-halo});
+                const bool inside = !(v.s&1) && (v.s&2) && v.hits>=occ_min_hits;
+                occupied |= inside;
+                const double magnitude = _meshMode=="distance" ? metricDistance(v.d) : 0.1*res;
+                dest[x+(y+static_cast<size_t>(z)*dim)*dim] = inside ? -magnitude : magnitude;
             }
-            return _curr + _j + _base;
-        }
-
-        Iterator& operator++()
-        {
-            _j++;
-            if(_j >= _cellSizeX)
-            {
-                _j = 0;
-                _i++;
-                _curr = _grid[_i];
-            }
-            return *this;
-        }
-
-    protected:
-        Grid* _parent;
-        VoxelData **_grid;
-        VoxelData *_curr;
-        uint32_t _i, _j, _base, _cellSizeX;
-    };
-
-    Grid(void)
-    {
-        _grid = NULL;
-        _buffer = NULL;
-        _garbage = VoxelData{db_tsdf::full_mask_v<Mask>, 0xFF, 0xFF};
-        _dummy = NULL;
-    }
-
-    void setup(float minX, float maxX, float minY, float maxY, float minZ, float maxZ, float cellRes = 0.05, int maxCells = 100000)
-    {
-        if(_grid != NULL)
-            free(_grid);
-
-        if(_buffer != NULL)
-            free(_buffer);
-
-        if(_dummy != NULL)
-            free(_dummy);
-
-        _maxX = (int)ceil(maxX);
-        _maxY = (int)ceil(maxY);
-        _maxZ = (int)ceil(maxZ);
-        _minX = (int)floor(minX);
-        _minY = (int)floor(minY);
-        _minZ = (int)floor(minZ);
-
-        _gridSizeX = abs(_maxX-_minX);
-        _gridSizeY = abs(_maxY-_minY);
-        _gridSizeZ = abs(_maxZ-_minZ);
-        _gridStepY = _gridSizeX;
-        _gridStepZ = _gridSizeX*_gridSizeY;
-        _gridSize = _gridSizeX*_gridSizeY*_gridSizeZ;
-
-        _maxCells = (uint64_t)maxCells;
-        _cellRes = cellRes;
-        _oneDivRes = 1.0/_cellRes;
-        _cellSizeX = (uint32_t)_oneDivRes;
-        _cellSizeY = (uint32_t)_oneDivRes;
-        _cellSizeZ = (uint32_t)_oneDivRes;
-        _cellStepY = _cellSizeX;
-        _cellStepZ = _cellSizeX*_cellSizeY;
-        _cellSize = 1 + static_cast<uint64_t>(_cellSizeX)*_cellSizeY*_cellSizeZ;
-        _buffer = (VoxelData *)malloc(_maxCells*_cellSize*sizeof(VoxelData));
-        std::memset(_buffer, -1, _maxCells*_cellSize*sizeof(VoxelData));
-        for(int i=0; i<_maxCells; i++)
-        {
-            writeControlIndex(&_buffer[i*_cellSize], _gridSize);
-        }
-        _cellIndex = 0;
-
-        _dummy = (VoxelData*)malloc(_cellSize * sizeof(VoxelData));
-        std::memset(_dummy, -1, _cellSize * sizeof(VoxelData));
-        writeControlIndex(_dummy, _gridSize);
-        _grid = (VoxelData**)malloc(_gridSize * sizeof(VoxelData*));
-        for (uint32_t k = 0; k < _gridSize; ++k) _grid[k] = _dummy;
-    }
-
-    ~Grid(void)
-    {
-        if(_grid != NULL)
-            free(_grid);
-
-        if(_buffer != NULL)
-            free(_buffer);
-
-        if(_dummy != NULL)
-            free(_dummy);
-    }
-
-    void clear(void)
-    {
-        for (uint32_t k = 0; k < _gridSize; ++k) _grid[k] = _dummy;
-        std::memset(_buffer, -1, _maxCells*_cellSize*sizeof(VoxelData));
-        for(uint64_t i=0; i<_maxCells; i++)
-        {
-            writeControlIndex(&_buffer[i*_cellSize], _gridSize);
-        }
-        _cellIndex = 0;
-    }
-
-    void allocCell(float x, float y, float z)
-    {
-        x -= _minX;
-        y -= _minY;
-        z -= _minZ;
-        uint32_t int_x = (uint32_t)x, int_y = (uint32_t)y, int_z = (uint32_t)z;
-        uint32_t i = int_x + int_y*_gridStepY + int_z*_gridStepZ;
-        if( _grid[i] == _dummy)
-        {
-            _grid[i] = _buffer + (_cellIndex % _maxCells)*_cellSize;
-            const uint32_t old_index = readControlIndex(_grid[i]);
-
-            if (old_index != _gridSize) {
-                _grid[old_index] = _dummy;
-            }
-
-            VoxelData* cell = _grid[i];
-            for (uint64_t j = 1; j < _cellSize; ++j) {
-                cell[j].d    = db_tsdf::full_mask_v<Mask>;
-                cell[j].s    = 1u;
-                cell[j].hits = 0u;
-            }
-
-            writeControlIndex(cell, i);
-            _cellIndex++;
-        }
-    }
-
-    VoxelData &operator()(float x, float y, float z)
-    {
-        x -= _minX;
-        y -= _minY;
-        z -= _minZ;
-        uint32_t int_x = (uint32_t)x, int_y = (uint32_t)y, int_z = (uint32_t)z;
-        uint32_t i = int_x + int_y*_gridStepY + int_z*_gridStepZ;
-        if(_grid[i] == _dummy) { return _garbage; }
-        uint32_t j = 1 + (uint32_t)((x-int_x)*_oneDivRes) + (uint32_t)((y-int_y)*_oneDivRes)*_cellStepY + (uint32_t)((z-int_z)*_oneDivRes)*_cellStepZ;
-        return _grid[i][j];
-    }
-
-    VoxelData read(float x, float y, float z)
-    {
-        x -= _minX;
-        y -= _minY;
-        z -= _minZ;
-        uint32_t int_x = (uint32_t)x, int_y = (uint32_t)y, int_z = (uint32_t)z;
-        uint32_t i = int_x + int_y*_gridStepY + int_z*_gridStepZ;
-        if(_grid[i] == _dummy) { return _garbage; }
-
-        uint32_t j = 1 + (uint32_t)((x-int_x)*_oneDivRes) + (uint32_t)((y-int_y)*_oneDivRes)*_cellStepY + (uint32_t)((z-int_z)*_oneDivRes)*_cellStepZ;
-        return _grid[i][j];
-    }
-
-    Iterator getIterator(float x, float y, float z)
-    {
-        x -= _minX;
-        y -= _minY;
-        z -= _minZ;
-        uint32_t int_x = (uint32_t)x, int_y = (uint32_t)y, int_z = (uint32_t)z;
-        uint32_t i = int_x + int_y*_gridStepY + int_z*_gridStepZ;
-
-        return Iterator(this, _grid, i, 1 + (uint32_t)((y-int_y)*_oneDivRes)*_cellStepY + (uint32_t)((z-int_z)*_oneDivRes)*_cellStepZ, (uint32_t)((x-int_x)*_oneDivRes), _cellSizeX);
-    }
-
-    void exportGridToPCD(const std::string& filename, int subsampling_factor)
-    {
-        using PointT = pcl::PointXYZ;
-        pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>);
-        const uint32_t step = std::max(1, subsampling_factor);
-
-        for (uint32_t cz = 0; cz < _gridSizeZ; ++cz)
-        {
-            const float z0 = _minZ + static_cast<float>(cz);
-            for (uint32_t cy = 0; cy < _gridSizeY; ++cy)
-            {
-                const float y0 = _minY + static_cast<float>(cy);
-                for (uint32_t cx = 0; cx < _gridSizeX; ++cx)
-                {
-                    const float x0 = _minX + static_cast<float>(cx);
-                    const uint32_t i = cx + cy * _gridStepY + cz * _gridStepZ;
-                    VoxelData* cell = _grid[i];
-                    if (cell == _dummy) continue;
-                    for (uint32_t vz = 0; vz < _cellSizeZ; vz += step) {
-                        for (uint32_t vy = 0; vy < _cellSizeY; vy += step) {
-                            for (uint32_t vx = 0; vx < _cellSizeX; vx += step) {
-                                const uint32_t j = 1u + vx + vy * _cellStepY + vz * _cellStepZ;
-                                const int dist = db_tsdf::maskRank(cell[j].d);
-                                if (dist > 1u) continue;
-                                if ((cell[j].s & 0x01u) != 0u) continue;
-
-                                PointT pt;
-                                pt.x = x0 + (vx + 0.5f) * _cellRes;
-                                pt.y = y0 + (vy + 0.5f) * _cellRes;
-                                pt.z = z0 + (vz + 0.5f) * _cellRes;
-                                cloud->push_back(pt);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (cloud->empty())
-        {
-            std::cerr << "[GRID" << mask_bits << "] Warning: Empty Cloud (no mask==0 found).\n";
-            return;
-        }
-
-        pcl::io::savePCDFileBinary(filename, *cloud);
-    }
-
-    void exportGridToPLY(const std::string& filename, int subsampling_factor)
-    {
-        using PointT = pcl::PointXYZ;
-        pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>);
-        const uint32_t step = std::max(1, subsampling_factor);
-
-        for (uint32_t cz = 0; cz < _gridSizeZ; ++cz)
-        {
-            const float z0 = _minZ + static_cast<float>(cz);
-            for (uint32_t cy = 0; cy < _gridSizeY; ++cy)
-            {
-                const float y0 = _minY + static_cast<float>(cy);
-                for (uint32_t cx = 0; cx < _gridSizeX; ++cx)
-                {
-                    const float x0 = _minX + static_cast<float>(cx);
-                    const uint32_t i = cx + cy * _gridStepY + cz * _gridStepZ;
-                    VoxelData* cell = _grid[i];
-                    if (cell == _dummy) continue;
-                    for (uint32_t vz = 0; vz < _cellSizeZ; vz += step) {
-                        for (uint32_t vy = 0; vy < _cellSizeY; vy += step) {
-                            for (uint32_t vx = 0; vx < _cellSizeX; vx += step) {
-                                const uint32_t j = 1u + vx + vy * _cellStepY + vz * _cellStepZ;
-                                const int dist = db_tsdf::maskRank(cell[j].d);
-                                if (dist > 1u) continue;
-                                if ((cell[j].s & 0x01u) != 0u) continue;
-
-                                PointT pt;
-                                pt.x = x0 + (vx + 0.5f) * _cellRes;
-                                pt.y = y0 + (vy + 0.5f) * _cellRes;
-                                pt.z = z0 + (vz + 0.5f) * _cellRes;
-                                cloud->push_back(pt);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (cloud->empty())
-        {
-            std::cerr << "[GRID" << mask_bits << "] Warning: Empty Cloud (no mask==0 found).\n";
-            return;
-        }
-
-        pcl::io::savePLYFileBinary(filename, *cloud);
-    }
-
-    void exportSubgridToCSV(const std::string& out_dir, int subsampling_factor)
-    {
-        (void)subsampling_factor;
-
-        std::filesystem::create_directories(out_dir);
-
-        for (uint32_t cz = 0; cz < _gridSizeZ; ++cz)
-        {
-            const float z0 = _minZ + static_cast<float>(cz);
-            for (uint32_t cy = 0; cy < _gridSizeY; ++cy)
-            {
-                const float y0 = _minY + static_cast<float>(cy);
-                for (uint32_t cx = 0; cx < _gridSizeX; ++cx)
-                {
-                    const float x0 = _minX + static_cast<float>(cx);
-
-                    const uint32_t i = cx + cy * _gridStepY + cz * _gridStepZ;
-                    VoxelData* cell = _grid[i];
-                    if (cell == _dummy) continue;
-
-                    bool has_occupied = false;
-                    for (uint32_t vz = 0; vz < _cellSizeZ && !has_occupied; ++vz)
-                    for (uint32_t vy = 0; vy < _cellSizeY && !has_occupied; ++vy)
-                    for (uint32_t vx = 0; vx < _cellSizeX; ++vx)
-                    {
-                        const uint32_t j = 1u + vx + vy * _cellStepY + vz * _cellStepZ;
-                        if ( (cell[j].s & 0x01u) == 0u ) { has_occupied = true; break; }
-                    }
-                    if (!has_occupied) continue;
-
-                    const int X = static_cast<int>(std::floor(x0 + 1e-6f));
-                    const int Y = static_cast<int>(std::floor(y0 + 1e-6f));
-                    const int Z = static_cast<int>(std::floor(z0 + 1e-6f));
-
-                    std::ostringstream base;
-                    base << out_dir << "/" << X << "_" << Y << "_" << Z;
-
-                    std::ofstream f_csv(base.str() + ".csv");
-                    if (!f_csv.is_open()) {
-                        std::cerr << "[GRID" << mask_bits << "] Could not open " << (base.str()+".csv") << "\n";
-                        continue;
-                    }
-                    f_csv << "x,y,z,d_manhattan,s,hits\n";
-                    f_csv << std::fixed << std::setprecision(6);
-
-                    std::vector<std::array<float,3>> pts;
-                    pts.reserve(1024);
-
-                    const float half = 0.5f * _cellRes;
-                    for (uint32_t vz = 0; vz < _cellSizeZ; ++vz)
-                    {
-                        const float z_voxel_min = z0 + static_cast<float>(vz) * _cellRes;
-                        for (uint32_t vy = 0; vy < _cellSizeY; ++vy)
-                        {
-                            const float y_voxel_min = y0 + static_cast<float>(vy) * _cellRes;
-                            for (uint32_t vx = 0; vx < _cellSizeX; ++vx)
-                            {
-                                const float x_voxel_min = x0 + static_cast<float>(vx) * _cellRes;
-                                const uint32_t j = 1u + vx + vy * _cellStepY + vz * _cellStepZ;
-
-                                const int distance_rank = db_tsdf::maskRank(cell[j].d);
-                                const uint32_t s = (cell[j].s & 0x01u);
-                                const uint32_t hits = static_cast<uint32_t>(cell[j].hits);
-
-                                const float cxp = x_voxel_min + half;
-                                const float cyp = y_voxel_min + half;
-                                const float czp = z_voxel_min + half;
-                                f_csv << cxp << "," << cyp << "," << czp << ","
-                                      << distance_rank << "," << s << "," << hits << "\n";
-
-                                if ( (s & 0x01u) == 0u ) {
-                                    pts.push_back({cxp, cyp, czp});
-                                }
-                            }
-                        }
-                    }
-                    f_csv.close();
-
-                    std::ofstream f_ply(base.str() + ".ply");
-                    if (!f_ply.is_open()) {
-                        std::cerr << "[GRID" << mask_bits << "] Could not open " << (base.str()+".ply") << "\n";
-                        continue;
-                    }
-                    f_ply << "ply\nformat ascii 1.0\n";
-                    f_ply << "element vertex " << pts.size() << "\n";
-                    f_ply << "property float x\nproperty float y\nproperty float z\n";
-                    f_ply << "end_header\n";
-                    f_ply << std::fixed << std::setprecision(6);
-                    for (const auto& p : pts) {
-                        f_ply << p[0] << " " << p[1] << " " << p[2] << "\n";
-                    }
-                    f_ply.close();
-                }
-            }
-        }
-    }
-
-    vtkSmartPointer<vtkPolyData> buildSurfaceMesh(float iso_level, int occ_min_hits)
-    {
-        vtkSmartPointer<vtkAppendPolyData> appender =
-            vtkSmartPointer<vtkAppendPolyData>::New();
-
-        const float BAND = 0.1f * _cellRes;
-
-        for (uint32_t cz = 0; cz < _gridSizeZ; ++cz)
-        for (uint32_t cy = 0; cy < _gridSizeY; ++cy)
-        for (uint32_t cx = 0; cx < _gridSizeX; ++cx)
-        {
-            const uint32_t i = cx + cy * _gridStepY + cz * _gridStepZ;
-            VoxelData* cell = _grid[i];
-            if (cell == _dummy) continue;
-
-            vtkSmartPointer<vtkImageData> image = vtkSmartPointer<vtkImageData>::New();
-            image->SetDimensions(_cellSizeX + 1, _cellSizeY + 1, _cellSizeZ + 1);
-            image->SetSpacing(_cellRes, _cellRes, _cellRes);
-
-            const float x0 = _minX + static_cast<float>(cx);
-            const float y0 = _minY + static_cast<float>(cy);
-            const float z0 = _minZ + static_cast<float>(cz);
-
-            image->SetOrigin(x0, y0, z0);
-            image->AllocateScalars(VTK_FLOAT, 1);
-
-            float *dest = static_cast<float*>(image->GetScalarPointer());
-            bool has_occupied_voxels = false;
-
-            for (uint32_t vz = 0; vz < _cellSizeZ + 1; ++vz)
-            for (uint32_t vy = 0; vy < _cellSizeY + 1; ++vy)
-            for (uint32_t vx = 0; vx < _cellSizeX + 1; ++vx)
-            {
-                VoxelData vox = this->read(x0 + vx * _cellRes,
-                                           y0 + vy * _cellRes,
-                                           z0 + vz * _cellRes);
-
-                const bool enough_hits = (vox.hits >= occ_min_hits);
-                const bool occupied = ((vox.s & 0x01u) == 0);
-
-                float sdf_value;
-                if (!enough_hits) {
-                    sdf_value = +BAND;
-                } else if (occupied) {
-                    sdf_value = -BAND;
-                    has_occupied_voxels = true;
-                } else {
-                    sdf_value = +BAND;
-                }
-
-                dest[vx + vy * (_cellSizeX + 1) + vz * (_cellSizeX + 1) * (_cellSizeY + 1)] = sdf_value;
-            }
-
-            if (has_occupied_voxels)
-            {
-                auto smoother = vtkSmartPointer<vtkImageGaussianSmooth>::New();
+            if (!occupied) continue;
+            auto mc = vtkSmartPointer<vtkMarchingCubes>::New();
+            auto smoother = vtkSmartPointer<vtkImageGaussianSmooth>::New();
+            if (_sigma>0) {
                 smoother->SetInputData(image);
-                smoother->SetStandardDeviation(1.0);
-                smoother->Update();
-
-                auto mc = vtkSmartPointer<vtkMarchingCubes>::New();
+                smoother->SetStandardDeviation(_sigma);
+                smoother->SetRadiusFactors(3,3,3);
                 mc->SetInputConnection(smoother->GetOutputPort());
-                mc->SetValue(0, iso_level);
-                mc->Update();
-
-                appender->AddInputData(mc->GetOutput());
+            } else mc->SetInputData(image);
+            mc->SetValue(0,iso_level);
+            mc->Update();
+            // Each cube has one owning block. Remove halo triangles and, in
+            // distance mode, cubes with unknown corners instead of inventing
+            // a surface against unobserved space.
+            auto part = vtkSmartPointer<vtkPolyData>::New();
+            auto faces = vtkSmartPointer<vtkCellArray>::New();
+            auto* mesh = mc->GetOutput();
+            part->SetPoints(mesh->GetPoints());
+            auto* polys = mesh->GetPolys();
+            polys->InitTraversal();
+            vtkIdType n; const vtkIdType* vertices;
+            while (polys->GetNextCell(n,vertices)) {
+                if (n!=3) continue;
+                std::array<double,3> centroid{};
+                for (int v=0;v<3;++v) {
+                    double pt[3]; mesh->GetPoint(vertices[v],pt);
+                    for (int a=0;a<3;++a) centroid[a]+=pt[a]/3;
+                }
+                Index cube;
+                bool keep = true;
+                for (int a=0;a<3;++a) {
+                    cube[a] = static_cast<int>(std::floor((centroid[a]-this->_min[a])/res-0.5+1e-6));
+                    keep &= cube[a]>=origin[a] && cube[a]<origin[a]+side;
+                }
+                if (_meshMode=="distance" && keep) {
+                    for (int z=0;z<2;++z) for (int y=0;y<2;++y) for (int x=0;x<2;++x)
+                        keep &= (this->readIndex({cube[0]+x,cube[1]+y,cube[2]+z}).s&2)!=0;
+                }
+                if (keep) faces->InsertNextCell(n,vertices);
             }
+            part->SetPolys(faces);
+            appender->AddInputData(part);
         }
-
-        std::cout << "[GRID" << mask_bits << "] Joining cell meshes...\n";
-        appender->Update();
-
+        if (!appender->GetNumberOfInputConnections(0)) return vtkSmartPointer<vtkPolyData>::New();
+        auto clean = vtkSmartPointer<vtkCleanPolyData>::New();
+        clean->SetInputConnection(appender->GetOutputPort());
+        clean->ToleranceIsAbsoluteOn();
+        clean->SetAbsoluteTolerance(res*1e-5);
+        clean->Update();
         auto out = vtkSmartPointer<vtkPolyData>::New();
-        out->ShallowCopy(appender->GetOutput());
+        out->ShallowCopy(clean->GetOutput());
         return out;
     }
-
     void exportMesh(const std::string& filename, float iso_level, int occ_min_hits)
     {
         vtkSmartPointer<vtkPolyData> mesh = buildSurfaceMesh(iso_level, occ_min_hits);
+        if (mesh->GetNumberOfPolys() == 0)
+            throw std::runtime_error("Mesh export: map has no surface triangles");
 
         auto ext_pos = filename.find_last_of('.');
         std::string ext = (ext_pos == std::string::npos) ? "" : filename.substr(ext_pos + 1);
@@ -685,6 +346,7 @@ public:
             mtl << "illum 1\n\n";
         }
         mtl.close();
+        if (!mtl) throw std::runtime_error("MTL write failed");
 
         std::ofstream obj(objFilename);
         if (!obj.is_open()) {
@@ -715,38 +377,18 @@ public:
         }
 
         obj.close();
+        if (!obj) throw std::runtime_error("OBJ write failed");
 
         std::cout << "[GRID" << mask_bits << "] OBJ export finished: " << objFilename
                   << " and " << mtlFilename
                   << " (" << faces.size() << " faces)\n";
     }
 
-protected:
-
-    static uint32_t readControlIndex(const VoxelData* cell)
-    {
-        uint32_t index;
-        std::memcpy(&index, cell, sizeof(index));
-        return index;
-    }
-
-    static void writeControlIndex(VoxelData* cell, uint32_t index)
-    {
-        std::memcpy(cell, &index, sizeof(index));
-    }
-
-    VoxelData **_grid;
-    float _maxX, _maxY, _maxZ, _minX, _minY, _minZ;
-    uint32_t _gridSizeX, _gridSizeY, _gridSizeZ, _gridStepY, _gridStepZ, _gridSize;
-    float _cellRes, _oneDivRes;
-    uint32_t _cellSizeX, _cellSizeY, _cellSizeZ, _cellStepY, _cellStepZ;
-    uint64_t _maxCells, _cellSize, _cellIndex;
-    VoxelData *_buffer;
-    VoxelData *_dummy;
-    VoxelData _garbage;
+private:
+    std::string _meshMode{"occupancy"};
+    double _sigma{1};
+    std::vector<double> _rankDistances;
 };
-
 using GRID16 = Grid<uint16_t>;
 using GRID32 = Grid<uint32_t>;
-
 #endif

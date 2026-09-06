@@ -1,0 +1,10 @@
+.git
+build
+install
+log
+datasets
+maps
+benchmark-results
+**/__pycache__
+*.pcd
+*.dbtsdf

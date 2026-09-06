@@ -1,0 +1,54 @@
+name: Build and regression tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  ros:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: humble
+            image: osrf/ros:humble-desktop@sha256:b624d8bcea33796d32e0dbd85326722188485759bbd6b538e4785750a5c88a7b
+          - distro: jazzy
+            image: osrf/ros:jazzy-desktop
+    container: ${{ matrix.image }}
+    env:
+      CMAKE_BUILD_PARALLEL_LEVEL: 2
+      OMP_NUM_THREADS: 2
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential cmake python3-colcon-common-extensions python3-yaml libeigen3-dev libpcl-dev libvtk9-dev libomp-dev libssl-dev nlohmann-json3-dev zip ros-${{ matrix.distro }}-pcl-conversions ros-${{ matrix.distro }}-tf2-geometry-msgs ros-${{ matrix.distro }}-rosbag2
+      - name: Build portable 16-bit and 32-bit nodes
+        run: |
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+          colcon build --packages-select db_tsdf --cmake-args -DCMAKE_BUILD_TYPE=Release -DDB_TSDF_NATIVE=OFF
+      - name: Core tests and ROS workflow
+        run: |
+          source /opt/ros/${{ matrix.distro }}/setup.bash
+          source install/setup.bash
+          ctest --test-dir build/db_tsdf --output-on-failure
+          timeout 180s python3 test/test_ros_smoke.py
+  sanitizers:
+    runs-on: ubuntu-24.04
+    env:
+      ASAN_OPTIONS: detect_leaks=0
+      UBSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeigen3-dev libpcl-dev libvtk9-dev libomp-dev libssl-dev nlohmann-json3-dev
+      - name: ROS-independent memory and correctness checks
+        run: |
+          cmake -S . -B build -DDB_TSDF_BUILD_ROS=OFF -DDB_TSDF_SANITIZERS=ON -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build -j2
+          ctest --test-dir build --output-on-failure

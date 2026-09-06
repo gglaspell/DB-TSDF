@@ -2,6 +2,9 @@
 #define DB_TSDF_TSDF3D_HPP
 
 #include <algorithm>
+#include <memory>
+#include <span>
+#include <omp.h>
 #include <db_tsdf/trilinear_params.hpp>
 #include <db_tsdf/grid.hpp>
 
@@ -14,7 +17,6 @@
 template <db_tsdf::SupportedMask Mask>
 struct DirectionalKernel
 {
-    std::vector<Mask> distance_masks;    // Truncated distance-rank masks
     std::vector<uint8_t>  signs;        // 0 = occ, 1 = free
 };
 
@@ -40,14 +42,16 @@ TSDF3D(void)
     m_oneDivRes = 1/m_resolution;
 }
 
-~TSDF3D(void)
-{
-}
+virtual ~TSDF3D() = default;
+TSDF3D(const TSDF3D&) = default;
+TSDF3D& operator=(const TSDF3D&) = default;
+TSDF3D(TSDF3D&&) noexcept = default;
+TSDF3D& operator=(TSDF3D&&) noexcept = default;
 
-void setup(float minX, float maxX,
-   float minY, float maxY,
-   float minZ, float maxZ,
-   float resolution,
+void setup(double minX, double maxX,
+   double minY, double maxY,
+   double minZ, double maxZ,
+   double resolution,
    int kernelSize,
    int occMinHits,
    int binsAz,
@@ -55,9 +59,44 @@ void setup(float minX, float maxX,
                int shadowRadius,
                std::string distanceMode,
    int maxCells = 50000,
-   bool verboseInit = false
+   bool verboseInit = false,
+   int threads = 0, const std::string& capacityPolicy = "stop",
+   double memoryBudgetMiB = 0
    )
 {
+    TSDF3D next;
+    next.configure(minX,maxX,minY,maxY,minZ,maxZ,resolution,kernelSize,occMinHits,
+                   binsAz,binsEl,shadowRadius,distanceMode,maxCells,verboseInit,
+                   threads,capacityPolicy,memoryBudgetMiB);
+    *this = std::move(next);
+}
+
+private:
+void configure(double minX,double maxX,double minY,double maxY,double minZ,double maxZ,
+               double resolution,int kernelSize,int occMinHits,int binsAz,int binsEl,
+               int shadowRadius,const std::string& distanceMode,int maxCells,bool verboseInit,
+               int threads,const std::string& capacityPolicy,double memoryBudgetMiB)
+{
+    if (kernelSize < 1 || kernelSize > 63 || kernelSize % 2 == 0)
+        throw std::invalid_argument("kernel_size must be odd and between 1 and 63");
+    if (occMinHits < 1 || occMinHits > 255)
+        throw std::invalid_argument("occ_min_hits must be between 1 and 255");
+    if (binsAz <= 0 || binsEl <= 0 || binsAz > 720 || binsEl > 360)
+        throw std::invalid_argument("bins_az must be 1..720 and bins_el 1..360");
+    if (shadowRadius < 0 || shadowRadius > 1024)
+        throw std::invalid_argument("shadow_radius must be 0..1024 voxels");
+    if (distanceMode != "L1" && distanceMode != "L2")
+        throw std::invalid_argument("distance_mode must be L1 or L2");
+    const size_t kernelVoxels = static_cast<size_t>(kernelSize)*kernelSize*kernelSize;
+    const size_t kernelBytes = kernelVoxels*(static_cast<size_t>(binsAz)*binsEl+sizeof(Mask));
+    if (kernelBytes > 512u*1024u*1024u)
+        throw std::invalid_argument("directional kernels exceed 512 MiB; reduce kernel size or bins");
+    setThreadCount(threads);
+    m_grid.setup(minX,maxX,minY,maxY,minZ,maxZ,resolution,maxCells,capacityPolicy,memoryBudgetMiB);
+    if (memoryBudgetMiB > 0 && (m_grid.estimatedBytes()+kernelBytes)/1048576.0 > memoryBudgetMiB)
+        throw std::invalid_argument("grid and kernels exceed memory_budget_mb");
+    m_bank = std::make_shared<KernelBank>();
+    m_r_squared_to_mask.clear();
     m_maxX = maxX;
     m_maxY = maxY;
     m_maxZ = maxZ;
@@ -78,13 +117,23 @@ void setup(float minX, float maxX,
 
     initDirectionalKernels();
 
-    // Setup grid
-    m_grid.setup(m_minX, m_maxX, m_minY, m_maxY, m_minZ, m_maxZ, m_resolution, maxCells);
+    std::vector<double> distances(mask_bits+1);
+    for (int rank=0;rank<=mask_bits;++rank) distances[rank]=rank*resolution;
+    if (distanceMode=="L2") {
+        std::vector<bool> assigned(mask_bits+1,false);
+        for (const auto& [r2, mask] : m_r_squared_to_mask) {
+            const int rank=db_tsdf::maskRank(mask);
+            if (!assigned[rank]) { distances[rank]=std::sqrt(r2)*resolution; assigned[rank]=true; }
+        }
+    }
+    m_grid.setRankDistances(std::move(distances));
 }
 
+public:
 void clear(void)
 {
     m_grid.clear();
+    m_lastIntegration = {};
 }
 
 void exportGridToPCD(const std::string& filename, int subsampling_factor)
@@ -121,7 +170,7 @@ void exportMeshOBJ(const std::string& basename,
 
 virtual inline bool isIntoGrid(const float &x, const float &y, const float &z)
 {
-    return (x > m_minX+1 && y > m_minY+1 && z > m_minZ+1 && x < m_maxX-1 && y < m_maxY-1 && z < m_maxZ-1);
+    return m_grid.contains(x,y,z);
 }
 
 
@@ -211,109 +260,133 @@ void loadCloudFiltered(std::vector<pcl::PointXYZ> &cloud,
 }
 
 
-void loadCloud(std::vector<pcl::PointXYZ> &cloud, const Eigen::Vector3f &sensor_pos_world)
+struct IntegrationStats {
+    size_t input_points{0}, valid_points{0}, invalid_points{0}, outside_points{0}, skipped_blocks{0};
+};
+void setThreadCount(int threads) {
+    if (threads < 0 || threads > 1024) throw std::invalid_argument("num_threads must be 0..1024");
+    m_threads = threads ? threads : omp_get_max_threads();
+}
+int threadCount() const { return m_threads; }
+const IntegrationStats& lastIntegration() const { return m_lastIntegration; }
+const GridType& grid() const { return m_grid; }
+GridType& grid() { return m_grid; }
+void configureMesh(const std::string& mode, double sigma=-1) { m_grid.configureMesh(mode,sigma); }
+std::string checkpointSignature(const std::string& frame) const {
+    return std::to_string(m_kernelSize)+" "+std::to_string(m_occMinHits)+" "+
+        std::to_string(m_binsAz)+" "+std::to_string(m_binsEl)+" "+
+        std::to_string(m_shadowRadiusMd)+" "+m_distanceMode+"\n"+frame;
+}
+void saveCheckpoint(const std::string& path,const std::string& frame={}) const {
+    m_grid.saveCheckpoint(path,checkpointSignature(frame));
+}
+void loadCheckpoint(const std::string& path,const std::string& frame={}) {
+    m_grid.loadCheckpoint(path,checkpointSignature(frame));
+}
+
+void loadCloud(std::span<const pcl::PointXYZ> cloud, const Eigen::Vector3f &sensor_pos_world)
 {
-    // Allocate required submetric cells
-    for(uint32_t i=0; i<cloud.size(); i++)
-    {
-        for(float z=cloud[i].z-1; z<=cloud[i].z+1; z+=1)
-        for(float y=cloud[i].y-1; y<=cloud[i].y+1; y+=1)
-        for(float x=cloud[i].x-1; x<=cloud[i].x+1; x+=1)
-        if(isIntoGrid(x, y, z))
-            m_grid.allocCell(x, y, z);
+    if (!sensor_pos_world.allFinite()) throw std::invalid_argument("sensor origin must be finite");
+    if (!m_bank) throw std::logic_error("call setup before integrating");
+    using Index = typename GridType::Index;
+    struct Point { Index center; int bin; };
+    std::vector<Point> points;
+    points.reserve(cloud.size());
+    std::map<uint32_t,std::vector<size_t>> work;
+    m_lastIntegration = {};
+    m_lastIntegration.input_points = cloud.size();
+    const int side = m_grid.blockSide();
+    const auto dims = m_grid.dimensions();
+    for (const auto& p : cloud) {
+        const Eigen::Vector3f direction = Eigen::Vector3f(p.x,p.y,p.z)-sensor_pos_world;
+        if (!direction.allFinite() || direction.squaredNorm() <= 1e-12f) {
+            ++m_lastIntegration.invalid_points; continue;
+        }
+        if (!m_grid.contains(p.x,p.y,p.z)) { ++m_lastIntegration.outside_points; continue; }
+        const auto center = m_grid.index(p.x,p.y,p.z);
+        const size_t pointIndex = points.size();
+        points.push_back({center,dirToBin(direction)});
+        ++m_lastIntegration.valid_points;
+        Index lo,hi;
+        for (int a=0;a<3;++a) {
+            lo[a] = std::max(0,center[a]-m_kernelRadius)/side*side;
+            hi[a] = std::min(dims[a]-1,center[a]+m_kernelRadius);
+        }
+        for (int z=lo[2];z<=hi[2];z+=side)
+        for (int y=lo[1];y<=hi[1];y+=side)
+        for (int x=lo[0];x<=hi[0];x+=side)
+            work[m_grid.blockId({x,y,z})].push_back(pointIndex);
     }
-
-    // Applies the pre-computed kernel to all grid cells centered in the cloud points
-    const float step = m_kernelRadius * m_resolution;
-
-    #pragma omp parallel for num_threads(16) shared(m_dirKernels, m_grid)
-    for(uint32_t i=0; i<cloud.size(); i++)
-    {
-
-        if(!isIntoGrid(cloud[i].x - step*2, cloud[i].y - step*2, cloud[i].z - step*2) ||
-           !isIntoGrid(cloud[i].x + step*2, cloud[i].y + step*2, cloud[i].z + step*2))
-        continue;
-
-        // Select kernel by ray direction
-        Eigen::Vector3f point_world(cloud[i].x, cloud[i].y, cloud[i].z);
-        Eigen::Vector3f dir = point_world - sensor_pos_world;
-        const Kernel& DK = m_dirKernels[dirToBin(dir)];
-
-        int xi, yi, zi, k = 0;
-        float x, y, z;
-        for(zi=0, z=cloud[i].z-step; zi<m_kernelSize; zi++, z+=m_resolution)
-        for(yi=0, y=cloud[i].y-step; yi<m_kernelSize; yi++, y+=m_resolution){
-            typename GridType::Iterator it = m_grid.getIterator(cloud[i].x-step,y,z);
-            for(xi=0, x=cloud[i].x-step; xi<m_kernelSize; xi++, x+=m_resolution,++it, ++k)
-            {
-                auto &v = *it;
-                Mask old_mask = v.d;
-                Mask new_mask = old_mask & DK.distance_masks[k];
-                if (new_mask != old_mask) v.d = new_mask;
-
-                if(DK.signs[k] == 0 && v.hits < m_occMinHits)
-                {
-                    ++v.hits;
-                    if (v.hits == m_occMinHits)
-                        v.s &= uint8_t(~0x01);
+    // Sorted, unique allocation order makes capacity handling reproducible.
+    for (const auto& [id,unused] : work) m_grid.allocateBlock(id);
+    struct Job { uint32_t id; const std::vector<size_t>* points; typename GridType::VoxelData* data; };
+    std::vector<Job> jobs;
+    jobs.reserve(work.size());
+    for (const auto& [id,indices] : work) {
+        auto* data = m_grid.blockData(id);
+        if (data) jobs.push_back({id,&indices,data});
+        else ++m_lastIntegration.skipped_blocks;
+    }
+    // A destination block has exactly one owner, including all kernels whose
+    // centers lie in neighboring blocks. No atomics or shared dummy voxel.
+    const int workers=static_cast<int>(std::min(jobs.size(),static_cast<size_t>(m_threads)));
+    #pragma omp parallel for num_threads(std::max(1,workers)) schedule(static) if(workers>1)
+    for (size_t j=0;j<jobs.size();++j) {
+        const auto& job = jobs[j];
+        const auto origin = m_grid.blockOrigin(job.id);
+        for (size_t pi : *job.points) {
+            const auto& point = points[pi];
+            const auto& signs = m_bank->kernels[point.bin].signs;
+            Index lo,hi;
+            for (int a=0;a<3;++a) {
+                lo[a] = std::max(origin[a],point.center[a]-m_kernelRadius);
+                hi[a] = std::min({origin[a]+side-1,dims[a]-1,point.center[a]+m_kernelRadius});
+            }
+            for (int z=lo[2];z<=hi[2];++z)
+            for (int y=lo[1];y<=hi[1];++y) {
+                size_t dst = lo[0]-origin[0]+(y-origin[1]+static_cast<size_t>(z-origin[2])*side)*side;
+                size_t k = lo[0]-point.center[0]+m_kernelRadius+
+                    (y-point.center[1]+m_kernelRadius+
+                     static_cast<size_t>(z-point.center[2]+m_kernelRadius)*m_kernelSize)*m_kernelSize;
+                for (int x=lo[0];x<=hi[0];++x,++dst,++k) {
+                    auto& v = job.data[dst];
+                    v.d &= m_bank->distances[k];
+                    v.s |= 2;
+                    if (!signs[k] && v.hits<m_occMinHits) {
+                        ++v.hits;
+                        if (v.hits==m_occMinHits) v.s &= uint8_t(~1u);
+                    }
                 }
             }
         }
     }
-    #pragma omp barrier
 }
 
-inline TrilinearParams computeDistInterpolation(const double &x, const double &y, const double &z)
+// Signed metric interpolation between voxel centers. Unknown support is
+// explicitly invalid; it must not look like a zero-distance surface.
+inline TrilinearParams computeDistInterpolation(const double& x,const double& y,const double& z) const
 {
     TrilinearParams r;
-
-    if(isIntoGrid(x, y, z))
-    {
-
-        // Get neightbour values to compute trilinear interpolation
-        float c000, c001, c010, c011, c100, c101, c110, c111;
-        c000 = db_tsdf::maskRank(m_grid.read(x, y, z).d);
-        c001 = db_tsdf::maskRank(m_grid.read(x, y, z+m_resolution).d);
-        c010 = db_tsdf::maskRank(m_grid.read(x, y+m_resolution, z).d);
-        c011 = db_tsdf::maskRank(m_grid.read(x, y+m_resolution, z+m_resolution).d);
-        c100 = db_tsdf::maskRank(m_grid.read(x+m_resolution, y, z).d);
-        c101 = db_tsdf::maskRank(m_grid.read(x+m_resolution, y, z+m_resolution).d);
-        c110 = db_tsdf::maskRank(m_grid.read(x+m_resolution, y+m_resolution, z).d);
-        c111 = db_tsdf::maskRank(m_grid.read(x+m_resolution, y+m_resolution, z+m_resolution).d);
-
-        // Compute trilinear parameters
-        const float div = -m_oneDivRes*m_oneDivRes*m_oneDivRes;
-        float x0, y0, z0, x1, y1, z1;
-        x0 = ((int)(x*m_oneDivRes))*m_resolution;
-        if(x0<0)
-            x0 -= m_resolution;
-        x1 = x0+m_resolution;
-        y0 = ((int)(y*m_oneDivRes))*m_resolution;
-        if(y0<0)
-            y0 -= m_resolution;
-        y1 = y0+m_resolution;
-        z0 = ((int)(z*m_oneDivRes))*m_resolution;
-        if(z0<0)
-            z0 -= m_resolution;
-        z1 = z0+m_resolution;
-        r.a0 = (-c000*x1*y1*z1 + c001*x1*y1*z0 + c010*x1*y0*z1 - c011*x1*y0*z0
-        + c100*x0*y1*z1 - c101*x0*y1*z0 - c110*x0*y0*z1 + c111*x0*y0*z0)*div;
-        r.a1 = (c000*y1*z1 - c001*y1*z0 - c010*y0*z1 + c011*y0*z0
-        - c100*y1*z1 + c101*y1*z0 + c110*y0*z1 - c111*y0*z0)*div;
-        r.a2 = (c000*x1*z1 - c001*x1*z0 - c010*x1*z1 + c011*x1*z0
-        - c100*x0*z1 + c101*x0*z0 + c110*x0*z1 - c111*x0*z0)*div;
-        r.a3 = (c000*x1*y1 - c001*x1*y1 - c010*x1*y0 + c011*x1*y0
-        - c100*x0*y1 + c101*x0*y1 + c110*x0*y0 - c111*x0*y0)*div;
-        r.a4 = (-c000*z1 + c001*z0 + c010*z1 - c011*z0 + c100*z1
-        - c101*z0 - c110*z1 + c111*z0)*div;
-        r.a5 = (-c000*y1 + c001*y1 + c010*y0 - c011*y0 + c100*y1
-        - c101*y1 - c110*y0 + c111*y0)*div;
-        r.a6 = (-c000*x1 + c001*x1 + c010*x1 - c011*x1 + c100*x0
-        - c101*x0 - c110*x0 + c111*x0)*div;
-        r.a7 = (c000 - c001 - c010 + c011 - c100
-        + c101 + c110 - c111)*div;
+    if (!m_grid.contains(x,y,z)) return r;
+    auto base=m_grid.index(x,y,z);
+    const std::array<double,3> query{x,y,z};
+    const auto center=m_grid.center(base);
+    for (int a=0;a<3;++a) if (query[a]<center[a]) --base[a];
+    std::array<double,8> c;
+    for (int dz=0;dz<2;++dz) for (int dy=0;dy<2;++dy) for (int dx=0;dx<2;++dx) {
+        const auto v=m_grid.readIndex({base[0]+dx,base[1]+dy,base[2]+dz});
+        if (!(v.s&2)) return r;
+        c[dx+2*dy+4*dz]=m_grid.metricDistance(v.d)*((v.s&1)?1:-1);
     }
-
+    r.origin=m_grid.center(base);
+    r.inverse_resolution=1/m_grid.resolution();
+    r.a0=c[0];
+    r.a1=c[1]-c[0]; r.a2=c[2]-c[0]; r.a3=c[4]-c[0];
+    r.a4=c[3]-c[2]-c[1]+c[0];
+    r.a5=c[5]-c[4]-c[1]+c[0];
+    r.a6=c[6]-c[4]-c[2]+c[0];
+    r.a7=c[7]-c[6]-c[5]-c[3]+c[4]+c[2]+c[1]-c[0];
+    r.valid=true;
     return r;
 }
 
@@ -321,21 +394,24 @@ protected:
 
 // Grid parameters
 GridType m_grid;
-float m_maxX, m_maxY, m_maxZ;
-float m_minX, m_minY, m_minZ;
-float m_resolution, m_oneDivRes;
-int m_occMinHits;
-int m_kernelSize;
-    int m_kernelRadius;
-int m_binsAz;
-    int m_binsEl;
-    int m_numBins;
-    int m_shadowRadiusMd;
+double m_maxX, m_maxY, m_maxZ;
+double m_minX, m_minY, m_minZ;
+double m_resolution, m_oneDivRes;
+int m_occMinHits{1};
+int m_kernelSize{1};
+    int m_kernelRadius{0};
+int m_binsAz{1};
+    int m_binsEl{1};
+    int m_numBins{1};
+    int m_shadowRadiusMd{0};
     std::string m_distanceMode;
     bool m_verboseInit{false};
 
 // Directional kernels
-std::vector<Kernel> m_dirKernels;
+struct KernelBank { std::vector<Kernel> kernels; std::vector<Mask> distances; };
+std::shared_ptr<KernelBank> m_bank;
+int m_threads{1};
+IntegrationStats m_lastIntegration;
 inline int dirToBin(const Eigen::Vector3f &v) const;
 void initDirectionalKernels();
 
@@ -353,7 +429,7 @@ inline int TSDF3D<Mask>::dirToBin(const Eigen::Vector3f &v) const
         az += 2.0f*M_PI;
     }
 
-    float el  = std::asin(v.z() / v.norm());
+    const double el = std::asin(std::clamp(v.z() / v.cast<double>().norm(), -1.0, 1.0));
     int   baz = int(az * m_binsAz / (2.0f*M_PI));
     int   bel = int((el + M_PI/2) * m_binsEl / M_PI);
 
@@ -413,9 +489,10 @@ inline void TSDF3D<Mask>::initDirectionalKernels()
     }
 
     // --- Kernel Generation ---
-    m_dirKernels.resize(m_numBins);
+    m_bank->kernels.resize(m_numBins);
 
     const int kernel_total_voxels = m_kernelSize * m_kernelSize * m_kernelSize;
+    m_bank->distances.resize(kernel_total_voxels);
 
     auto binToDir = [&](int az,int el) // <-- Añadido [&] para capturar 'this'
     {
@@ -428,10 +505,9 @@ inline void TSDF3D<Mask>::initDirectionalKernels()
     for(int el=0; el < m_binsEl; ++el)
     for(int az=0; az < m_binsAz; ++az)
     {
-        Kernel& DK = m_dirKernels[el*m_binsAz+az];
+        Kernel& DK = m_bank->kernels[el*m_binsAz+az];
         Eigen::Vector3f dir = binToDir(az,el).normalized();
 
-        DK.distance_masks.resize(kernel_total_voxels);
         DK.signs.resize(kernel_total_voxels);
 
         int k=0;
@@ -443,15 +519,15 @@ inline void TSDF3D<Mask>::initDirectionalKernels()
             float re2 = float(x*x + y*y + z*z);
 
             // The Distance Mode "switch"
-            if (m_distanceMode == "L1")
+            if (el == 0 && az == 0 && m_distanceMode == "L1")
             {
                 int l1_dist = std::abs(x) + std::abs(y) + std::abs(z);
-                DK.distance_masks[k] = db_tsdf::rankMask<Mask>(l1_dist);
+                m_bank->distances[k] = db_tsdf::rankMask<Mask>(l1_dist);
             }
-            else // "L2"
+            else if (el == 0 && az == 0) // "L2"
             {
                 int r2_int = x*x + y*y + z*z;
-                DK.distance_masks[k] = m_r_squared_to_mask[r2_int];
+                m_bank->distances[k] = m_r_squared_to_mask[r2_int];
             }
 
             bool behind   = dir.dot(Eigen::Vector3f(x,y,z)) >= 0.0f;
@@ -480,7 +556,7 @@ inline void TSDF3D<Mask>::initDirectionalKernels()
                 for(int x = -m_kernelRadius; x <= m_kernelRadius; ++x) {
                     int ix = x + m_kernelRadius;
                     int k_idx = (iz * m_kernelSize * m_kernelSize) + (iy * m_kernelSize) + ix;
-                    Mask mask = DK.distance_masks[k_idx];
+                    Mask mask = m_bank->distances[k_idx];
                     int rank = db_tsdf::maskRank(mask);
                     uint8_t sign = DK.signs[k_idx];
                     char sign_char = (sign == 0) ? '#' : '.';

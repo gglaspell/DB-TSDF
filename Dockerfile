@@ -1,77 +1,33 @@
-# DB-TSDF image — built on osrf/ros:humble-desktop (ROS 2 Humble on Ubuntu 22.04)
-#
-# Uses the official OSRF ROS image, which already ships ROS 2 Humble Desktop,
-# its apt repo, and a UTF-8 locale. This file only adds DB-TSDF's extra
-# dependencies, clones the repo, and builds it with colcon.
-
-FROM osrf/ros:humble-desktop
-
+# Build the supplied checkout. Refresh ROS_IMAGE deliberately after testing.
+# Digest resolved from Docker Hub on 2026-09-05 CDT.
+ARG ROS_IMAGE=osrf/ros:humble-desktop@sha256:b624d8bcea33796d32e0dbd85326722188485759bbd6b538e4785750a5c88a7b
+FROM ${ROS_IMAGE}
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
-ENV LANG=en_US.UTF-8
-ENV LC_ALL=en_US.UTF-8
-
-# --- Extra build tools not guaranteed in the base image --------------------
-RUN apt update && apt install -y --no-install-recommends \
-    sudo \
-    git \
-    cmake \
-    build-essential \
-    python3-pip \
-    wget \
-    zip \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake git python3-colcon-common-extensions python3-venv \
+    python3-pip python3-yaml wget zip libeigen3-dev libpcl-dev libvtk9-dev \
+    libomp-dev libssl-dev nlohmann-json3-dev \
+    ros-${ROS_DISTRO}-pcl-conversions ros-${ROS_DISTRO}-tf2-geometry-msgs \
+    ros-${ROS_DISTRO}-robot-localization ros-${ROS_DISTRO}-rosbag2 \
     && rm -rf /var/lib/apt/lists/*
-
-# --- DB-TSDF build/runtime dependencies not included in humble-desktop -----
-# ros-humble-desktop itself already provides rclcpp, geometry-msgs,
-# sensor-msgs, std-srvs, etc. This list only adds what's missing.
-RUN apt update && apt install -y --no-install-recommends \
-    ros-humble-tf2-ros \
-    ros-humble-tf2-geometry-msgs \
-    ros-humble-pcl-conversions \
-    ros-humble-pcl-ros \
-    ros-humble-message-filters \
-    ros-humble-robot-localization \
-    libeigen3-dev \
-    libboost-all-dev \
-    libomp-dev \
-    libpcl-dev \
-    libvtk9-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python ROS tools not preinstalled in the base image
-RUN pip3 install -U \
-    colcon-common-extensions \
-    rosdep \
-    vcstool
-
-# Initialize rosdep (system-wide, requires root — must run before USER switch)
-RUN rosdep init || true
-
-# --- Non-root user matching the host UID/GID -------------------------------
 ARG USERNAME=ros
 ARG USER_UID=1000
 ARG USER_GID=1000
 RUN groupadd -g ${USER_GID} ${USERNAME} && \
-    useradd -m -u ${USER_UID} -g ${USER_GID} ${USERNAME} && \
-    echo "${USERNAME}:${USERNAME}" | chpasswd && \
-    adduser ${USERNAME} sudo && \
-    echo "${USERNAME} ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/${USERNAME}
-
-USER ${USERNAME}
+    useradd -m -u ${USER_UID} -g ${USER_GID} ${USERNAME}
 WORKDIR /home/${USERNAME}/ros2_ws
-RUN mkdir -p src
-
-# rosdep update caches its index under $HOME/.ros/rosdep — run it as the
-# user that will later call `rosdep install`.
-RUN rosdep update || true
-
-# --- Clone and build DB-TSDF ------------------------------------------------
-RUN git clone -b atak https://github.com/gglaspell/DB-TSDF.git src/db_tsdf && \
-    /bin/bash -c "source /opt/ros/humble/setup.bash && \
-        rosdep install --from-paths src --ignore-src -r -y && \
-        colcon build"
-
-# Auto-source workspace setup once it has been built
+COPY --chown=${USER_UID}:${USER_GID} . src/db_tsdf/
+RUN chown ${USER_UID}:${USER_GID} .
+USER ${USERNAME}
+ARG BUILD_JOBS=2
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
+ENV DB_TSDF_WORKSPACE=/home/${USERNAME}/ros2_ws
+RUN source /opt/ros/${ROS_DISTRO}/setup.bash && \
+    colcon build --executor sequential --cmake-args \
+      -DCMAKE_BUILD_TYPE=Release -DDB_TSDF_NATIVE=OFF && \
+    ctest --test-dir build/db_tsdf --output-on-failure && \
+    dpkg-query -W > install/system-packages.txt
 RUN echo "source /home/${USERNAME}/ros2_ws/install/setup.bash" >> /home/${USERNAME}/.bashrc
-
+ENTRYPOINT ["/bin/bash", "-c", "source /opt/ros/${ROS_DISTRO}/setup.bash && source \"${DB_TSDF_WORKSPACE}/install/setup.bash\" && exec \"$@\"", "--"]
 CMD ["bash"]

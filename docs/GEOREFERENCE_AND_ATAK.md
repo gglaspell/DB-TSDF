@@ -75,6 +75,11 @@ and the latest valid GNSS fix with its covariance. It is a bridge input contract
 private JSON sidecar is not by itself proof that a particular ATAK client will
 import it as a native overlay.
 
+The service returns a queued job ID and a unique directory under
+`output_directory`. Poll `export_status` for completion before transferring
+the archive. Its `run.json` records the map snapshot, configuration and file
+checksums; the datum remains immutable while the latest valid fix can change.
+
 `/get_geo_origin` returns the same JSON contract. Validate a deployment by
 placing a known object at a surveyed location, exporting it, and checking both
 its ATAK placement and the corresponding ROS `map` coordinates.
